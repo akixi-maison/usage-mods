@@ -1,0 +1,9 @@
+{
+  "name": "usage-mods",
+  "version": "0.1.0",
+  "description": "Shows context, rate-limit and cost usage above the prompt",
+  "author": {
+    "name": "akixi-maison"
+  },
+  "types": "./types/index.d.ts"
+}

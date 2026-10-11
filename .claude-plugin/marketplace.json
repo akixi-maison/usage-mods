@@ -1,0 +1,13 @@
+{
+  "name": "usage-mods",
+  "description": "Claude Code usage band: context and rate-limit progress bars with a compact button",
+  "owner": {
+    "name": "akixi-maison"
+  },
+  "plugins": [
+    {
+      "name": "usage-mods",
+      "source": "./"
+    }
+  ]
+}
