@@ -6,6 +6,6 @@ export type Usage = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-mods': { usage: Usage | null; isCompacting: boolean }
+    'usage-mods': { usage: Usage | null; isCompacting: boolean; now: number }
   }
 }
