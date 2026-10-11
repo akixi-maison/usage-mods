@@ -5,6 +5,7 @@ import type { Usage } from '../types'
 
 const usage = atom({ plugin: 'usage-mods', key: 'usage' } as const, null)
 const isCompacting = atom({ plugin: 'usage-mods', key: 'isCompacting' } as const, false)
+const clockNow = atom({ plugin: 'usage-mods', key: 'now' } as const, 0)
 
 const LABELS: Record<string, string> = { five_hour: '5시간', seven_day: '7일', spend_limit: '한도' }
 
@@ -45,6 +46,31 @@ const center = (text: string): string => {
 export const canCompact = (u: Usage, isWorking: boolean, compacting: boolean): boolean =>
   !isWorking && !compacting && (u.contextPercent ?? 0) > 0
 
+const MINUTE = 60_000
+const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
+
+/** `주간 한도 초기화까지 3일 0시간`; null while the 7-day window has no reset time. */
+export const weeklyReset = (u: Usage, now: number): string | null => {
+  const resetsAt = u.limits.find(l => l.kind === 'seven_day')?.resetsAt
+  if (resetsAt === undefined) {
+    return null
+  }
+  const ms = Math.max(0, Date.parse(resetsAt) - now)
+  const days = Math.floor(ms / DAY)
+  const hours = Math.floor((ms % DAY) / HOUR)
+  const minutes = Math.floor((ms % HOUR) / MINUTE)
+  const left =
+    days > 0 ? `${days}일 ${hours}시간` : hours > 0 ? `${hours}시간 ${minutes}분` : `${minutes}분`
+  return `주간 한도 초기화까지 ${left}`
+}
+
+// Moves the clock the countdown reads, so the band redraws once a minute.
+const tick = async ($: EngineInterface) => {
+  const now = await $.clock.now()
+  await update($, clockNow, () => now)
+}
+
 export const QUESTION = '압축하시겠습니까?'
 export const YES = '예'
 export const NO = '아니오'
@@ -63,6 +89,8 @@ export const register: Register = on => {
     const result = await next(e)
     const u = await $.session.usage()
     await update($, usage, () => toUsage(u))
+    await tick($)
+    $.clock.every(MINUTE, () => void tick($))
     return result
   })
 
@@ -78,6 +106,8 @@ export const register: Register = on => {
     }
 
     const rows = meters(u)
+    const hasReset = u.limits.some(l => l.kind === 'seven_day' && l.resetsAt !== undefined)
+    const reset = hasReset ? weeklyReset(u, (await read($, clockNow)) || (await $.clock.now())) : null
     const compacting = await read($, isCompacting)
     const isEnabled = canCompact(u, e.props.isWorking, compacting)
     const { Box, Button, Text } = $.ui.resolve(e)
@@ -132,7 +162,12 @@ export const register: Register = on => {
           )}
         </Box>
         {limits.map(meter)}
-        {u.usd === undefined ? null : <Text dimColor>${u.usd.toFixed(2)}</Text>}
+        {u.usd === undefined ? null : (
+          <Box key="usd" marginRight={2}>
+            <Text dimColor>${u.usd.toFixed(2)}</Text>
+          </Box>
+        )}
+        {reset === null ? null : <Text dimColor>{reset}</Text>}
       </Box>
     )
   })
