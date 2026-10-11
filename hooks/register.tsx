@@ -50,7 +50,7 @@ const MINUTE = 60_000
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
-/** `주간 한도 초기화까지 3일 0시간`; null while the 7-day window has no reset time. */
+/** `초기화까지 3일 0시간`; null while the 7-day window has no reset time. */
 export const weeklyReset = (u: Usage, now: number): string | null => {
   const resetsAt = u.limits.find(l => l.kind === 'seven_day')?.resetsAt
   if (resetsAt === undefined) {
@@ -62,7 +62,7 @@ export const weeklyReset = (u: Usage, now: number): string | null => {
   const minutes = Math.floor((ms % HOUR) / MINUTE)
   const left =
     days > 0 ? `${days}일 ${hours}시간` : hours > 0 ? `${hours}시간 ${minutes}분` : `${minutes}분`
-  return `주간 한도 초기화까지 ${left}`
+  return `초기화까지 ${left}`
 }
 
 // Moves the clock the countdown reads, so the band redraws once a minute.

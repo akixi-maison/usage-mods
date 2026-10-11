@@ -126,10 +126,10 @@ const RESETS_AT = '2026-10-14T06:00:00Z'
 
 test('counts down to the 7-day reset in days, then hours, then minutes', async () => {
   const u = { limits: [{ kind: 'seven_day', percentUsed: 40, resetsAt: RESETS_AT }] }
-  expect(weeklyReset(u, NOW)).toBe('주간 한도 초기화까지 3일 0시간')
-  expect(weeklyReset(u, NOW + 25 * 3600_000 + 13 * 60_000)).toBe('주간 한도 초기화까지 1일 22시간')
-  expect(weeklyReset(u, NOW + 49 * 3600_000 + 13 * 60_000)).toBe('주간 한도 초기화까지 22시간 47분')
-  expect(weeklyReset(u, NOW + 72 * 3600_000 - 13 * 60_000)).toBe('주간 한도 초기화까지 13분')
+  expect(weeklyReset(u, NOW)).toBe('초기화까지 3일 0시간')
+  expect(weeklyReset(u, NOW + 25 * 3600_000 + 13 * 60_000)).toBe('초기화까지 1일 22시간')
+  expect(weeklyReset(u, NOW + 49 * 3600_000 + 13 * 60_000)).toBe('초기화까지 22시간 47분')
+  expect(weeklyReset(u, NOW + 72 * 3600_000 - 13 * 60_000)).toBe('초기화까지 13분')
   expect(weeklyReset({ limits: [{ kind: 'seven_day', percentUsed: 40 }] }, NOW)).toBeNull()
   expect(weeklyReset({ limits: [] }, NOW)).toBeNull()
 })
@@ -149,11 +149,11 @@ test('draws the countdown after the cost and moves it every minute', async ($, o
   await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
-    expect(await ui.find({ type: 'Text', text: '주간 한도 초기화까지 3일 0시간' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '초기화까지 3일 0시간' })).toBeDefined()
     await ui.unmount()
   }
   await clock.advance(72 * 3600_000 - 13 * 60_000)
   const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
-  expect(await ui.find({ type: 'Text', text: '주간 한도 초기화까지 13분' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '초기화까지 13분' })).toBeDefined()
   await ui.unmount()
 })
