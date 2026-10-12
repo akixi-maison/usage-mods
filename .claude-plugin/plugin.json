@@ -1,6 +1,6 @@
 {
   "name": "usage-mods",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Shows context, rate-limit and cost usage above the prompt",
   "author": {
     "name": "akixi-maison"

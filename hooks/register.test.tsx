@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bar, canCompact, meterColor, meters, weeklyReset } from './register'
+import { bar, canCompact, hoverText, meterColor, meters, weeklyReset } from './register'
 
 const PROPS = {
   hasSurvey: false,
@@ -156,4 +156,34 @@ test('draws the countdown after the cost and moves it every minute', async ($, o
   const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
   expect(await ui.find({ type: 'Text', text: '초기화까지 13분' })).toBeDefined()
   await ui.unmount()
+})
+
+test('hovering the 5-hour meter tells when it resets, with the 7-day countdown rules', async () => {
+  const u = {
+    limits: [
+      { kind: 'five_hour', percentUsed: 23, resetsAt: '2026-10-11T08:13:00Z' },
+      { kind: 'seven_day', percentUsed: 40, resetsAt: RESETS_AT },
+    ],
+  }
+  const [, five, seven] = meters(u)
+  expect(hoverText(u, five!, NOW)).toBe('23% · 2시간 13분 후 재설정')
+  expect(hoverText(u, five!, NOW + 2 * 3600_000)).toBe('23% · 13분 후 재설정')
+  expect(hoverText(u, seven!, NOW)).toBe('40%')
+  expect(hoverText({ limits: [{ kind: 'five_hour', percentUsed: 23 }] }, five!, NOW)).toBe('23%')
+})
+
+test('draws the 5-hour reset time in the hover card', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.measure({
+    context: { window: 200000, tokens: 60000, percent: 30 },
+    rateLimits: [{ kind: 'five_hour', percentUsed: 23, resetsAt: '2026-10-11T08:13:00Z' }],
+    changed: ['context', 'rateLimits'],
+  })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
+    expect(await ui.find({ type: 'Text', text: '23% · 2시간 13분 후 재설정' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^ *30% *$/ })).toBeDefined()
+    await ui.unmount()
+  }
 })
