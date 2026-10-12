@@ -50,19 +50,25 @@ const MINUTE = 60_000
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
-/** `초기화까지 3일 0시간`; null while the 7-day window has no reset time. */
-export const weeklyReset = (u: Usage, now: number): string | null => {
-  const resetsAt = u.limits.find(l => l.kind === 'seven_day')?.resetsAt
-  if (resetsAt === undefined) {
-    return null
-  }
+/** `3일 0시간` from a day out, `2시간 13분` within one, `13분` within the hour. */
+export const timeLeft = (resetsAt: string, now: number): string => {
   const ms = Math.max(0, Date.parse(resetsAt) - now)
   const days = Math.floor(ms / DAY)
   const hours = Math.floor((ms % DAY) / HOUR)
   const minutes = Math.floor((ms % HOUR) / MINUTE)
-  const left =
-    days > 0 ? `${days}일 ${hours}시간` : hours > 0 ? `${hours}시간 ${minutes}분` : `${minutes}분`
-  return `초기화까지 ${left}`
+  return days > 0 ? `${days}일 ${hours}시간` : hours > 0 ? `${hours}시간 ${minutes}분` : `${minutes}분`
+}
+
+/** `초기화까지 3일 0시간`; null while the 7-day window has no reset time. */
+export const weeklyReset = (u: Usage, now: number): string | null => {
+  const resetsAt = u.limits.find(l => l.kind === 'seven_day')?.resetsAt
+  return resetsAt === undefined ? null : `초기화까지 ${timeLeft(resetsAt, now)}`
+}
+
+/** What hovering a meter shows: the percent, and for the 5-hour window when it resets. */
+export const hoverText = (u: Usage, m: Meter, now: number): string => {
+  const resetsAt = m.key === 'five_hour' ? u.limits.find(l => l.kind === 'five_hour')?.resetsAt : undefined
+  return resetsAt === undefined ? `${m.percent}%` : `${m.percent}% · ${timeLeft(resetsAt, now)} 후 재설정`
 }
 
 // Moves the clock the countdown reads, so the band redraws once a minute.
@@ -106,8 +112,9 @@ export const register: Register = on => {
     }
 
     const rows = meters(u)
-    const hasReset = u.limits.some(l => l.kind === 'seven_day' && l.resetsAt !== undefined)
-    const reset = hasReset ? weeklyReset(u, (await read($, clockNow)) || (await $.clock.now())) : null
+    const hasReset = u.limits.some(l => l.resetsAt !== undefined)
+    const now = hasReset ? (await read($, clockNow)) || (await $.clock.now()) : 0
+    const reset = weeklyReset(u, now)
     const compacting = await read($, isCompacting)
     const isEnabled = canCompact(u, e.props.isWorking, compacting)
     const { Box, Button, Text } = $.ui.resolve(e)
@@ -141,7 +148,7 @@ export const register: Register = on => {
           <Box key={`${m.key}-bar`}>
             <Text color={color}>{bar(m.percent)}</Text>
             <Box position="absolute" top={0} left={0} display="none" hover={{ display: 'flex' }}>
-              <Text bold inverse color={color}>{center(`${m.percent}%`)}</Text>
+              <Text bold inverse color={color}>{center(hoverText(u, m, now))}</Text>
             </Box>
           </Box>
         </Box>
