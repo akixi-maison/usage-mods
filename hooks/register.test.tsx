@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bar, canCompact, hoverText, meterColor, meters, weeklyReset } from './register'
+import { bar, canCompact, isHeadlessRefusal, hoverText, meterColor, meters, weeklyReset } from './register'
 
 const PROPS = {
   hasSurvey: false,
@@ -186,4 +186,9 @@ test('draws the 5-hour reset time in the hover card', async ($, on) => {
     expect(await ui.find({ type: 'Text', text: /^ *30% *$/ })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('recognises the desktop app refusing to compact outside a turn', async () => {
+  expect(isHeadlessRefusal('$.session.compact: not available in a headless (-p / SDK) session yet: compaction here runs inside a turn (a /compact prompt); catch it and carry on')).toBe(true)
+  expect(isHeadlessRefusal('a hook said no')).toBe(false)
 })

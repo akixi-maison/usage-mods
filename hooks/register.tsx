@@ -43,6 +43,9 @@ const center = (text: string): string => {
  * not while a turn runs, not while one is under way, and not before the live
  * window's first response (a fresh or just-compacted session has no fill yet).
  */
+/** `$.session.compact` refuses in a headless (SDK) session, which is how the desktop app runs Claude Code. */
+export const isHeadlessRefusal = (message: string): boolean => /headless/i.test(message)
+
 export const canCompact = (u: Usage, isWorking: boolean, compacting: boolean): boolean =>
   !isWorking && !compacting && (u.contextPercent ?? 0) > 0
 
@@ -134,7 +137,14 @@ export const register: Register = on => {
           $.ui.toast('컨텍스트를 압축했어요')
         }
       } catch (error) {
-        $.ui.toast(`압축하지 못했어요: ${error instanceof Error ? error.message : String(error)}`)
+        const message = error instanceof Error ? error.message : String(error)
+        if (isHeadlessRefusal(message)) {
+          // The desktop app and other SDK hosts compact only inside a turn: send /compact as the person's prompt.
+          await $.prompt.submit({ text: '/compact', asUser: true })
+          $.ui.toast('압축을 시작했어요')
+        } else {
+          $.ui.toast(`압축하지 못했어요: ${message}`)
+        }
       } finally {
         await update($, isCompacting, () => false)
       }
