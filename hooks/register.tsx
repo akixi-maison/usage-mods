@@ -38,14 +38,14 @@ const center = (text: string): string => {
   return ' '.repeat(left) + text + ' '.repeat(pad - left)
 }
 
+/** `$.session.compact` refuses in a headless (SDK) session, which is how the desktop app runs Claude Code. */
+export const isHeadlessRefusal = (message: string): boolean => /headless/i.test(message)
+
 /**
  * Compaction runs between turns over a conversation the model has answered:
  * not while a turn runs, not while one is under way, and not before the live
  * window's first response (a fresh or just-compacted session has no fill yet).
  */
-/** `$.session.compact` refuses in a headless (SDK) session, which is how the desktop app runs Claude Code. */
-export const isHeadlessRefusal = (message: string): boolean => /headless/i.test(message)
-
 export const canCompact = (u: Usage, isWorking: boolean, compacting: boolean): boolean =>
   !isWorking && !compacting && (u.contextPercent ?? 0) > 0
 
@@ -93,7 +93,71 @@ const confirmCompact = async ($: EngineInterface): Promise<boolean> => {
   }
 }
 
+// One compaction at a time across redraws and repeated presses; the module's own, so a reload clears it.
+let isBusy = false
+
+/**
+ * Asks, then compacts. Runs on a timer, not inside the press: the band redraws often (usage updates,
+ * the minute clock), and work tied to the drawn Button or its press dispatch is lost with it.
+ */
+const runCompact = async ($: EngineInterface) => {
+  try {
+    $.ui.log('usage-mods: compact pressed, asking', { to: 'debug' })
+    if (!(await confirmCompact($))) {
+      $.ui.log('usage-mods: compact declined', { to: 'debug' })
+      return
+    }
+    await update($, isCompacting, () => true)
+    try {
+      const result = await $.session.compact()
+      if (result.skip !== undefined) {
+        $.ui.log(`usage-mods: compact skipped: ${result.skip}`, { to: 'debug' })
+        $.ui.toast(`압축하지 않았어요: ${result.skip}`)
+      } else {
+        $.ui.log('usage-mods: compacted', { to: 'debug' })
+        const after = await $.session.usage()
+        await update($, usage, () => toUsage(after))
+        $.ui.toast('컨텍스트를 압축했어요')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      $.ui.log(`usage-mods: compact refused: ${message}`, { to: 'debug' })
+      if (isHeadlessRefusal(message)) {
+        // The desktop app and other SDK hosts compact only inside a turn: send /compact as the person's prompt.
+        await $.prompt.submit({ text: '/compact', asUser: true })
+        $.ui.log('usage-mods: sent /compact', { to: 'debug' })
+        $.ui.toast('압축을 시작했어요')
+      } else {
+        $.ui.toast(`압축하지 못했어요: ${message}`)
+      }
+    } finally {
+      await update($, isCompacting, () => false)
+    }
+  } finally {
+    isBusy = false
+  }
+}
+
+const startCompact = ($: EngineInterface) => {
+  if (isBusy) {
+    return
+  }
+  isBusy = true
+  try {
+    $.clock.after(0, () => void runCompact($))
+  } catch (error) {
+    isBusy = false
+    throw error
+  }
+}
+
 export const register: Register = on => {
+  // Takes the press by its key, before the drawn Button's own onPress: a redraw replaces that handler.
+  on('ui.press', { plugin: 'usage-mods', element: 'compact' }, ($, e) => {
+    startCompact($)
+    return { element: e.element }
+  })
+
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     const u = await $.session.usage()
@@ -122,34 +186,6 @@ export const register: Register = on => {
     const isEnabled = canCompact(u, e.props.isWorking, compacting)
     const { Box, Button, Text } = $.ui.resolve(e)
 
-    const compact = async () => {
-      if (!(await confirmCompact($))) {
-        return
-      }
-      await update($, isCompacting, () => true)
-      try {
-        const result = await $.session.compact()
-        if (result.skip !== undefined) {
-          $.ui.toast(`압축하지 않았어요: ${result.skip}`)
-        } else {
-          const after = await $.session.usage()
-          await update($, usage, () => toUsage(after))
-          $.ui.toast('컨텍스트를 압축했어요')
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        if (isHeadlessRefusal(message)) {
-          // The desktop app and other SDK hosts compact only inside a turn: send /compact as the person's prompt.
-          await $.prompt.submit({ text: '/compact', asUser: true })
-          $.ui.toast('압축을 시작했어요')
-        } else {
-          $.ui.toast(`압축하지 못했어요: ${message}`)
-        }
-      } finally {
-        await update($, isCompacting, () => false)
-      }
-    }
-
     const meter = (m: Meter) => {
       const color = meterColor(m.percent)
       return (
@@ -173,7 +209,7 @@ export const register: Register = on => {
         {meter(context)}
         <Box key="compact-slot" marginRight={2}>
           {isEnabled ? (
-            <Button key="compact" label="압축" onPress={compact} />
+            <Button key="compact" label="압축" onPress={() => startCompact($)} />
           ) : (
             <Text dimColor>{compacting ? '[ 압축 중… ]' : '[ 압축 ]'}</Text>
           )}

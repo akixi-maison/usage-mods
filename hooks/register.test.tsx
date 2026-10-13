@@ -83,6 +83,7 @@ test('the button is disabled while a turn runs and enabled between turns', async
 
 for (const [answer, expected] of [['예', 1], ['아니오', 0]] as const) {
   test(`pressing it asks first and compacts only on 예 (${answer})`, async ($, on) => {
+    const clock = mock.clock(on)
     let compactions = 0
     const asked: string[] = []
     const toasts: string[] = []
@@ -103,6 +104,7 @@ for (const [answer, expected] of [['예', 1], ['아니오', 0]] as const) {
     await $.session.measure(MEASURE)
     const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
     await ui.press({ key: 'compact' })
+    await clock.advance(0)
     expect(asked).toEqual(['압축하시겠습니까? 예 / 아니오'])
     expect(compactions).toBe(expected)
     expect(toasts).toEqual(expected === 1 ? ['압축하지 않았어요: a hook said no'] : [])
@@ -191,4 +193,49 @@ test('draws the 5-hour reset time in the hover card', async ($, on) => {
 test('recognises the desktop app refusing to compact outside a turn', async () => {
   expect(isHeadlessRefusal('$.session.compact: not available in a headless (-p / SDK) session yet: compaction here runs inside a turn (a /compact prompt); catch it and carry on')).toBe(true)
   expect(isHeadlessRefusal('a hook said no')).toBe(false)
+})
+
+test('the compaction still runs when the band is redrawn away right after the press', async ($, on) => {
+  const clock = mock.clock(on)
+  let compactions = 0
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+    const [q] = e.questions
+    return { result: { questions: e.questions, answers: { [q.question]: '예' } } } as never
+  })
+  on('session.compact', () => {
+    compactions += 1
+    return { skip: 'a hook said no' }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  await $.session.measure(MEASURE)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  await ui.press({ key: 'compact' })
+  await ui.unmount()
+  await clock.advance(0)
+  expect(compactions).toBe(1)
+})
+
+test('a second press while the question is open does not ask twice', async ($, on) => {
+  const clock = mock.clock(on)
+  let asked = 0
+  let answer: (value: unknown) => void = () => {}
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
+    asked += 1
+    await new Promise(resolve => {
+      answer = resolve
+    })
+    const [q] = e.questions
+    return { result: { questions: e.questions, answers: { [q.question]: '아니오' } } } as never
+  })
+  await $.session.measure(MEASURE)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  await ui.press({ key: 'compact' })
+  await ui.press({ key: 'compact' })
+  await clock.advance(0)
+  await clock.advance(0)
+  answer(undefined)
+  expect(asked).toBe(1)
+  await ui.unmount()
 })
