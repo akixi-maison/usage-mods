@@ -13,6 +13,7 @@ import {
   LOG_FILE,
   meterColor,
   meters,
+  OFF_HINT,
   QUEUE_TIMEOUT,
   shouldSendCompact,
   weeklyReset,
@@ -88,13 +89,37 @@ test('the button is disabled while a turn runs and enabled between turns', async
   for (const surface of ['terminal', 'desktop'] as const) {
     const busy = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
     expect(await busy.find({ key: 'compact' })).toBeUndefined()
-    expect(await busy.find({ type: 'Text', text: '[ 압축 ]' })).toBeDefined()
+    expect((await busy.find({ key: 'compact-off' }))?.props).toMatchObject({ label: '압축', dimColor: true })
     await busy.unmount()
 
     const idle = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
     expect(await idle.find({ key: 'compact' })).toBeDefined()
     await idle.unmount()
   }
+})
+
+test('pressing the button while it is off only says why', async ($, on) => {
+  const clock = mock.clock(on)
+  let asked = 0
+  const toasts: string[] = []
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('tool.call', { tool: 'AskUserQuestion' }, () => {
+    asked += 1
+    return { result: {} } as never
+  })
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  await $.session.measure(MEASURE)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+    await ui.press({ key: 'compact-off' })
+    await clock.advance(0)
+    await ui.unmount()
+  }
+  expect(toasts).toEqual([OFF_HINT, OFF_HINT])
+  expect(asked).toBe(0)
 })
 
 for (const [answer, expected] of [['예', 1], ['아니오', 0]] as const) {
@@ -337,7 +362,7 @@ test('in the desktop app it runs /compact and stays compacting until the compact
   expect(world.commands).toEqual(['/compact from plugin'])
   expect(world.toasts).toEqual(['압축을 요청했어요'])
   expect(await ui.find({ key: 'compact' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: '[ 압축 중… ]' })).toBeDefined()
+  expect((await ui.find({ key: 'compact-off' }))?.props.label).toBe('압축 중…')
 
   // The command compacts the conversation, then ends.
   world.compactConversation()
@@ -345,7 +370,7 @@ test('in the desktop app it runs /compact and stays compacting until the compact
   await clock.advance(0)
   expect(world.toasts).toEqual(['압축을 요청했어요', '컨텍스트를 압축했어요'])
   // Out of compacting, and off until the model answers again (the context fill is unknown).
-  expect(await ui.find({ type: 'Text', text: '[ 압축 ]' })).toBeDefined()
+  expect((await ui.find({ key: 'compact-off' }))?.props.label).toBe('압축')
 
   // Letting go of the wait went with it.
   await clock.advance(QUEUE_TIMEOUT)
@@ -373,7 +398,7 @@ test('a /compact still queued after the wait lets go of the button', async ($, o
   await ui.press({ key: 'compact' })
   await clock.advance(0)
   expect(await ui.find({ key: 'compact' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: '[ 압축 중… ]' })).toBeDefined()
+  expect((await ui.find({ key: 'compact-off' }))?.props.label).toBe('압축 중…')
   await clock.advance(QUEUE_TIMEOUT)
   expect(world.toasts).toEqual(['압축을 요청했어요', '압축되지 않았어요. 입력창에 /compact를 보내 주세요'])
   expect(await ui.find({ key: 'compact' })).toBeDefined()

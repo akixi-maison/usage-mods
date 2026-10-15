@@ -147,6 +147,10 @@ export const QUESTION = '압축하시겠습니까?'
 export const YES = '예'
 export const NO = '아니오'
 
+/** What pressing the button says while it is off. */
+export const OFF_HINT = '답변이 끝나면 압축할 수 있어요'
+export const COMPACTING_HINT = '압축하는 중이에요'
+
 /** How long the /compact the band ran may wait for its compaction before the band lets go. */
 export const QUEUE_TIMEOUT = 10 * MINUTE
 
@@ -281,6 +285,12 @@ export const register: Register = on => {
   // Takes the press by its key, before the drawn Button's own onPress: a redraw replaces that handler.
   on('ui.press', { plugin: 'usage-mods', element: 'compact' }, ($, e) => {
     startCompact($)
+    return { element: e.element }
+  })
+
+  // The button while it is off: a press only says why.
+  on('ui.press', { plugin: 'usage-mods', element: 'compact-off' }, async ($, e) => {
+    $.ui.toast((await read($, isCompacting)) ? COMPACTING_HINT : OFF_HINT)
     return { element: e.element }
   })
 
@@ -419,7 +429,13 @@ export const register: Register = on => {
           {isEnabled ? (
             <Button key="compact" label="압축" onPress={() => startCompact($)} />
           ) : (
-            <Text dimColor>{compacting ? '[ 압축 중… ]' : '[ 압축 ]'}</Text>
+            // Off, the same button drawn dim, so the band keeps one look on every surface.
+            <Button
+              key="compact-off"
+              label={compacting ? '압축 중…' : '압축'}
+              dimColor
+              onPress={() => $.ui.toast(compacting ? COMPACTING_HINT : OFF_HINT)}
+            />
           )}
         </Box>
         {limits.map(meter)}
