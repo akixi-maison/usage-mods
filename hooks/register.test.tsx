@@ -4,6 +4,8 @@ import type { TestBody } from 'claude-code/testing'
 import {
   appendLine,
   bar,
+  BAR_PX,
+  barSvg,
   canCompact,
   describePrompt,
   hasCompacted,
@@ -61,13 +63,32 @@ test('draws bars with the percent hidden until hovered', async ($, on) => {
   })
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
-    expect(await ui.find({ type: 'Text', text: '███░░░░░░░' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '█████████░' })).toBeDefined()
+    if (surface === 'terminal') {
+      expect(await ui.find({ type: 'Text', text: '███░░░░░░░' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: '█████████░' })).toBeDefined()
+      expect(await ui.find({ type: 'Svg' })).toBeUndefined()
+    } else {
+      expect(await ui.find({ type: 'Text', text: /█|░/ })).toBeUndefined()
+      const bars = await ui.findAll({ type: 'Svg' })
+      expect(bars.map(b => b.props.alt)).toEqual(['컨텍스트 30%', '7일 85%'])
+      expect(bars[1]?.props).toMatchObject({ source: barSvg(85, 'yellow'), ...BAR_PX })
+    }
     expect(await ui.find({ key: 'seven_day-bar' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /85%/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /\$0\.50/ })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('the desktop bar fills in proportion, clamped, and shows a dot for a little use', async () => {
+  const fill = (svg: string) => [...svg.matchAll(/<rect width="([\d.]+)"/g)].map(m => Number(m[1]))
+  expect(fill(barSvg(0, 'green'))).toEqual([96])
+  expect(fill(barSvg(24, 'green'))).toEqual([96, 23])
+  expect(fill(barSvg(1, 'green'))).toEqual([96, 6])
+  expect(fill(barSvg(100, 'red'))).toEqual([96, 96])
+  expect(fill(barSvg(130, 'red'))).toEqual([96, 96])
+  expect(barSvg(24, 'green')).toContain('fill="#2f9e57"')
+  expect(barSvg(95, 'red')).toContain('fill="#d93f3f"')
 })
 
 const MEASURE = {

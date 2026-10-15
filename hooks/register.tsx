@@ -33,6 +33,26 @@ export const bar = (percent: number): string => {
 export const meterColor = (percent: number): 'red' | 'yellow' | 'green' =>
   percent >= 90 ? 'red' : percent >= 80 ? 'yellow' : 'green'
 
+// Off the terminal a bar is a picture: a rounded track and its fill, in CSS pixels. A picture cannot
+// follow the theme, so the track is a see-through grey and the fills read on light and dark alike.
+export const BAR_PX = { width: 96, height: 6 }
+const BAR_FILL: Record<ReturnType<typeof meterColor>, string> = { green: '#2f9e57', yellow: '#c27c0e', red: '#d93f3f' }
+
+/** The bar as SVG: the fill in proportion, clamped, never thinner than its own height once above 0. */
+export const barSvg = (percent: number, color: ReturnType<typeof meterColor>): string => {
+  const { width, height } = BAR_PX
+  const p = Math.min(Math.max(percent, 0), 100)
+  const filled = p === 0 ? 0 : Math.max((p / 100) * width, height)
+  const rect = (w: number, paint: string) =>
+    `<rect width="${Number(w.toFixed(1))}" height="${height}" rx="${height / 2}" ${paint}/>`
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
+    rect(width, 'fill="#808080" fill-opacity="0.25"') +
+    (filled === 0 ? '' : rect(filled, `fill="${BAR_FILL[color]}"`)) +
+    '</svg>'
+  )
+}
+
 const center = (text: string): string => {
   const pad = Math.max(BAR_WIDTH - text.length, 0)
   const left = Math.floor(pad / 2)
@@ -384,7 +404,10 @@ export const register: Register = on => {
     const compacting = await read($, isCompacting)
     const turnRunning = await read($, isTurnRunning)
     const isEnabled = canCompact(u, e.props.isWorking || turnRunning, compacting)
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const table = $.ui.resolve(e)
+    const { Box, Button, Text } = table
+    // The terminal draws the bar in block glyphs; elsewhere they show seams and a dotted track.
+    const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
 
     // The terminal lays the hover over the bar's own cells, reversed; the desktop draws the hover Box
     // as a card of its own above the band, where reversed text reads as a highlighter mark.
@@ -405,10 +428,14 @@ export const register: Register = on => {
       // The weekly countdown sits beside the 7-day bar it belongs to.
       const after = m.key === 'seven_day' ? reset : null
       return (
-        <Box key={m.key} flexDirection="row" marginRight={2}>
+        <Box key={m.key} flexDirection="row" alignItems="center" marginRight={2}>
           <Text dimColor>{m.label} </Text>
           <Box key={`${m.key}-bar`}>
-            <Text color={color}>{bar(m.percent)}</Text>
+            {Svg === undefined ? (
+              <Text color={color}>{bar(m.percent)}</Text>
+            ) : (
+              <Svg source={barSvg(m.percent, color)} alt={`${m.label} ${m.percent}%`} {...BAR_PX} />
+            )}
             <Box position="absolute" top={0} left={0} display="none" hover={{ display: 'flex' }}>
               {hoverCard(m, color)}
             </Box>
