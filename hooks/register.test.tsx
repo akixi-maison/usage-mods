@@ -1,6 +1,21 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
-import { bar, canCompact, isHeadlessRefusal, hoverText, meterColor, meters, weeklyReset } from './register'
+import {
+  appendLine,
+  bar,
+  canCompact,
+  describePrompt,
+  hasCompacted,
+  hoverText,
+  isHeadlessRefusal,
+  LOG_FILE,
+  meterColor,
+  meters,
+  QUEUE_TIMEOUT,
+  shouldSendCompact,
+  weeklyReset,
+} from './register'
 
 const PROPS = {
   hasSurvey: false,
@@ -89,7 +104,7 @@ for (const [answer, expected] of [['예', 1], ['아니오', 0]] as const) {
     const toasts: string[] = []
     on('session.measure', ($, e) => ({ changed: e.changed }))
     on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
-      const [q] = e.questions
+      const q = e.questions[0]!
       asked.push(`${q.question} ${q.options.map(o => o.label).join(' / ')}`)
       return { result: { questions: e.questions, answers: { [q.question]: answer } } } as never
     })
@@ -200,7 +215,7 @@ test('the compaction still runs when the band is redrawn away right after the pr
   let compactions = 0
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
-    const [q] = e.questions
+    const q = e.questions[0]!
     return { result: { questions: e.questions, answers: { [q.question]: '예' } } } as never
   })
   on('session.compact', () => {
@@ -226,7 +241,7 @@ test('a second press while the question is open does not ask twice', async ($, o
     await new Promise(resolve => {
       answer = resolve
     })
-    const [q] = e.questions
+    const q = e.questions[0]!
     return { result: { questions: e.questions, answers: { [q.question]: '아니오' } } } as never
   })
   await $.session.measure(MEASURE)
@@ -237,5 +252,173 @@ test('a second press while the question is open does not ask twice', async ($, o
   await clock.advance(0)
   answer(undefined)
   expect(asked).toBe(1)
+  await ui.unmount()
+})
+
+test('a refused compaction becomes /compact where no person is at the prompt, or when it says headless', async () => {
+  expect(shouldSendCompact('a turn is running', false)).toBe(true)
+  expect(shouldSendCompact('not available in a headless (-p / SDK) session yet', true)).toBe(true)
+  expect(shouldSendCompact('a turn is running', true)).toBe(false)
+})
+
+type TestArgs = Parameters<TestBody>
+// The desktop app's world: an SDK session (no person at the prompt) whose $.session.compact refuses,
+// and whose /compact command runs until `endCommand` and prints `output`; `compactConversation`
+// empties the context as a compaction does.
+const desktopCompaction = async ($: TestArgs[0], on: TestArgs[1], output = '') => {
+  const commands: string[] = []
+  const toasts: string[] = []
+  let context: { window: number; tokens?: number; percent?: number } = MEASURE.context
+  let endCommand = () => {}
+  const commandEnded = new Promise<void>(resolve => {
+    endCommand = resolve
+  })
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: { startedAt: 0, context, rateLimits: MEASURE.rateLimits } }))
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+    const q = e.questions[0]!
+    return { result: { questions: e.questions, answers: { [q.question]: '예' } } } as never
+  })
+  on('command.run', { command: 'compact' }, async ($, e) => {
+    commands.push(`/${e.command} from ${e.origin.kind}`)
+    await commandEnded
+    return { text: output }
+  })
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
+  await $.session.measure(MEASURE)
+  return {
+    commands,
+    toasts,
+    compactConversation: () => {
+      context = { window: 200000 }
+    },
+    endCommand,
+  }
+}
+
+test('in the desktop app it runs /compact and stays compacting until the compaction lands', async ($, on) => {
+  const clock = mock.clock(on)
+  const world = await desktopCompaction($, on)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  await ui.press({ key: 'compact' })
+  await clock.advance(0)
+  expect(world.commands).toEqual(['/compact from plugin'])
+  expect(world.toasts).toEqual(['압축을 요청했어요'])
+  expect(await ui.find({ key: 'compact' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '[ 압축 중… ]' })).toBeDefined()
+
+  // The command compacts the conversation, then ends.
+  world.compactConversation()
+  world.endCommand()
+  await clock.advance(0)
+  expect(world.toasts).toEqual(['압축을 요청했어요', '컨텍스트를 압축했어요'])
+  // Out of compacting, and off until the model answers again (the context fill is unknown).
+  expect(await ui.find({ type: 'Text', text: '[ 압축 ]' })).toBeDefined()
+
+  // Letting go of the wait went with it.
+  await clock.advance(QUEUE_TIMEOUT)
+  expect(world.toasts).toEqual(['압축을 요청했어요', '컨텍스트를 압축했어요'])
+  await ui.unmount()
+})
+
+test('a /compact that compacts nothing says so and frees the button', async ($, on) => {
+  const clock = mock.clock(on)
+  const world = await desktopCompaction($, on, 'Not enough messages to compact.')
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  await ui.press({ key: 'compact' })
+  await clock.advance(0)
+  world.endCommand()
+  await clock.advance(0)
+  expect(world.toasts).toEqual(['압축을 요청했어요', '압축되지 않았어요: Not enough messages to compact.'])
+  expect(await ui.find({ key: 'compact' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a /compact still queued after the wait lets go of the button', async ($, on) => {
+  const clock = mock.clock(on)
+  const world = await desktopCompaction($, on)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  await ui.press({ key: 'compact' })
+  await clock.advance(0)
+  expect(await ui.find({ key: 'compact' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '[ 압축 중… ]' })).toBeDefined()
+  await clock.advance(QUEUE_TIMEOUT)
+  expect(world.toasts).toEqual(['압축을 요청했어요', '압축되지 않았어요. 입력창에 /compact를 보내 주세요'])
+  expect(await ui.find({ key: 'compact' })).toBeDefined()
+
+  // The command ending later changes nothing more.
+  world.endCommand()
+  await clock.advance(0)
+  expect(world.toasts).toHaveLength(2)
+  await ui.unmount()
+})
+
+test('the command compacted when the context fill dropped or is unknown again', async () => {
+  expect(hasCompacted(30, 4)).toBe(true)
+  expect(hasCompacted(30, undefined)).toBe(true)
+  expect(hasCompacted(30, 30)).toBe(false)
+  expect(hasCompacted(30, 31)).toBe(false)
+})
+
+test('the button is off while a turn runs even when the band is told it is idle', async ($, on) => {
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'hello', turnId: 't1' })
+  const busy = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  expect(await busy.find({ key: 'compact' })).toBeUndefined()
+  await busy.unmount()
+
+  // A subagent's turn ending does not end the main one.
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', agentId: 'a1', reason: 'answer' })
+  const still = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  expect(await still.find({ key: 'compact' })).toBeUndefined()
+  await still.unmount()
+
+  await $.turn.complete({ answer: 'hi', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  const idle = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  expect(await idle.find({ key: 'compact' })).toBeDefined()
+  await idle.unmount()
+})
+
+test('the trace keeps the newest lines and names no prompt but /compact', async () => {
+  expect(appendLine('', 'a')).toBe('a\n')
+  expect(appendLine('a\nb\n', 'c')).toBe('a\nb\nc\n')
+  expect(appendLine('a\nb\nc\n', 'd', 3)).toBe('b\nc\nd\n')
+  expect(describePrompt('/compact')).toBe('/compact')
+  expect(describePrompt('my secret plan')).toBe('prompt of 14 chars')
+})
+
+test('each step of a press is written to the trace file under HOME', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/home/someone' })
+  let file = ''
+  const paths: string[] = []
+  on('fs.read', () => ({ value: file }))
+  on('fs.write', ($, e) => {
+    paths.push(e.path)
+    file = e.text
+    return { value: undefined }
+  })
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+    const q = e.questions[0]!
+    return { result: { questions: e.questions, answers: { [q.question]: '아니오' } } } as never
+  })
+  await $.session.measure(MEASURE)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  await ui.press({ key: 'compact' })
+  await clock.advance(0)
+  for (let i = 0; i < 20 && !file.includes('declined'); i += 1) {
+    await clock.advance(0)
+  }
+  expect(new Set(paths)).toEqual(new Set([`/home/someone/${LOG_FILE}`]))
+  expect(file).toMatch(/pressed: band isWorking=false, turn running=false, context=30%\n.*declined\n$/)
   await ui.unmount()
 })

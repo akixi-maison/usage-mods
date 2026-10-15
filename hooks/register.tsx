@@ -1,10 +1,11 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionMeasureInput } from 'claude-code'
+import type { EngineInterface, Register, SessionMeasureInput, Timer } from 'claude-code'
 
 import type { Usage } from '../types'
 
 const usage = atom({ plugin: 'usage-mods', key: 'usage' } as const, null)
 const isCompacting = atom({ plugin: 'usage-mods', key: 'isCompacting' } as const, false)
+const isTurnRunning = atom({ plugin: 'usage-mods', key: 'isTurnRunning' } as const, false)
 const clockNow = atom({ plugin: 'usage-mods', key: 'now' } as const, 0)
 
 const LABELS: Record<string, string> = { five_hour: '5시간', seven_day: '7일', spend_limit: '한도' }
@@ -40,6 +41,13 @@ const center = (text: string): string => {
 
 /** `$.session.compact` refuses in a headless (SDK) session, which is how the desktop app runs Claude Code. */
 export const isHeadlessRefusal = (message: string): boolean => /headless/i.test(message)
+
+/**
+ * Whether a refused compaction is sent as a /compact prompt instead: in a session with no person at
+ * the prompt (the desktop app, an SDK host) whatever the reason, or when the refusal says headless.
+ */
+export const shouldSendCompact = (message: string, isInteractive: boolean): boolean =>
+  !isInteractive || isHeadlessRefusal(message)
 
 /**
  * Compaction runs between turns over a conversation the model has answered:
@@ -80,9 +88,59 @@ const tick = async ($: EngineInterface) => {
   await update($, clockNow, () => now)
 }
 
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+
+// --- Compaction trace (temporary) -------------------------------------------------------------
+// Kept while checking that the compact button really compacts in the desktop app, where the
+// debug log is out of reach: each step is also appended to ~/.claude/usage-mods-compact.log.
+// Remove this block and the trace() calls once compaction is confirmed.
+
+export const LOG_FILE = '.claude/usage-mods-compact.log'
+const LOG_LIMIT = 300
+
+export const logLine = (time: number, session: string, text: string): string =>
+  `${new Date(time).toISOString()} [${session.slice(0, 8)}] ${text}`
+
+/** The log's text with `line` added, keeping the newest `limit` lines. */
+export const appendLine = (text: string, line: string, limit = LOG_LIMIT): string =>
+  [...text.split('\n').filter(l => l !== ''), line].slice(-limit).join('\n') + '\n'
+
+/** A prompt as the trace names it: `/compact` itself, otherwise only its length. */
+export const describePrompt = (text: string): string =>
+  text.trim() === '/compact' ? '/compact' : `prompt of ${text.length} chars`
+
+// One write at a time, so one session's lines keep their order; every session shares the file.
+let traceQueue: Promise<void> = Promise.resolve()
+
+const writeTrace = async ($: EngineInterface, text: string) => {
+  const home = await $.env.get('HOME')
+  if (home === undefined || home === '') {
+    return
+  }
+  const path = `${home}/${LOG_FILE}`
+  const [now, session, before] = await Promise.all([
+    $.clock.now(),
+    $.session.id().catch(() => '?'),
+    $.fs.read(path).catch(() => ''),
+  ])
+  await $.fs.write(path, appendLine(before, logLine(now, session, text)))
+}
+
+const trace = ($: EngineInterface, text: string) => {
+  $.ui.log(`usage-mods: ${text}`, { to: 'debug' })
+  traceQueue = traceQueue.then(() => writeTrace($, text)).catch(() => {})
+}
+
+// The band's isWorking as last drawn, for the trace to set beside the plugin's own turn tracking.
+let lastIsWorking: boolean | undefined
+// --- end of compaction trace -------------------------------------------------------------------
+
 export const QUESTION = '압축하시겠습니까?'
 export const YES = '예'
 export const NO = '아니오'
+
+/** How long the /compact the band ran may wait for its compaction before the band lets go. */
+export const QUEUE_TIMEOUT = 10 * MINUTE
 
 // Dismissing the dialog counts as 아니오.
 const confirmCompact = async ($: EngineInterface): Promise<boolean> => {
@@ -96,50 +154,110 @@ const confirmCompact = async ($: EngineInterface): Promise<boolean> => {
 // One compaction at a time across redraws and repeated presses; the module's own, so a reload clears it.
 let isBusy = false
 
+// Whether a person is at the prompt, as session.start said: false in the desktop app.
+let isInteractive = true
+
+// A /compact the band sent, waiting for the compaction it asked for; `timer` lets go of it.
+let waiting: { timer: Timer | null } | null = null
+
+const finishWaiting = async ($: EngineInterface, toast: string) => {
+  if (waiting === null) {
+    return
+  }
+  waiting.timer?.cancel()
+  waiting = null
+  await update($, isCompacting, () => false)
+  $.ui.toast(toast)
+}
+
+/**
+ * After the /compact command: whether it compacted, read from the context fill (it drops, or is
+ * unknown until the next answer) in case no `session.compact` reached this plugin.
+ */
+export const hasCompacted = (before: number, after: number | undefined): boolean => (after ?? 0) < before
+
+const endCompactCommand = async ($: EngineInterface, before: number, output: string) => {
+  const now = await $.session.usage()
+  await update($, usage, () => toUsage(now))
+  trace($, `/compact command ended, context ${before}% → ${now.context.percent}%: ${output || '(no output)'}`)
+  if (hasCompacted(before, now.context.percent)) {
+    await finishWaiting($, '컨텍스트를 압축했어요')
+  } else {
+    await finishWaiting($, output ? `압축되지 않았어요: ${output}` : '압축되지 않았어요')
+  }
+}
+
+/**
+ * The desktop app and other SDK hosts compact only inside a turn: runs /compact as if the person
+ * typed it (`$.prompt.submit` refuses a text that starts with `/`), queued until the session is idle.
+ * The band keeps compacting until the compaction lands (`session.compact`), the command ends
+ * (compacted or not), or the wait runs out.
+ */
+const sendCompact = ($: EngineInterface, before: number) => {
+  waiting = {
+    timer: $.clock.after(QUEUE_TIMEOUT, () => {
+      trace($, `no compaction within ${QUEUE_TIMEOUT / MINUTE} minutes; letting go`)
+      void finishWaiting($, '압축되지 않았어요. 입력창에 /compact를 보내 주세요')
+    }),
+  }
+  $.ui.toast('압축을 요청했어요')
+  void (async () => {
+    try {
+      const result = await $.command.run({ command: 'compact' })
+      await endCompactCommand($, before, result.text ?? '')
+    } catch (error) {
+      const message = errorMessage(error)
+      trace($, `/compact command failed: ${message}`)
+      await finishWaiting($, `압축하지 못했어요: ${message}`)
+    }
+  })()
+}
+
 /**
  * Asks, then compacts. Runs on a timer, not inside the press: the band redraws often (usage updates,
  * the minute clock), and work tied to the drawn Button or its press dispatch is lost with it.
  */
 const runCompact = async ($: EngineInterface) => {
+  let isWaiting = false
   try {
-    $.ui.log('usage-mods: compact pressed, asking', { to: 'debug' })
+    const [u, turnRunning] = await Promise.all([read($, usage), read($, isTurnRunning)])
+    trace($, `pressed: band isWorking=${lastIsWorking}, turn running=${turnRunning}, context=${u?.contextPercent}%`)
     if (!(await confirmCompact($))) {
-      $.ui.log('usage-mods: compact declined', { to: 'debug' })
+      trace($, 'declined')
       return
     }
     await update($, isCompacting, () => true)
     try {
       const result = await $.session.compact()
       if (result.skip !== undefined) {
-        $.ui.log(`usage-mods: compact skipped: ${result.skip}`, { to: 'debug' })
+        trace($, `compact skipped: ${result.skip}`)
         $.ui.toast(`압축하지 않았어요: ${result.skip}`)
       } else {
-        $.ui.log('usage-mods: compacted', { to: 'debug' })
+        trace($, 'compacted')
         const after = await $.session.usage()
         await update($, usage, () => toUsage(after))
         $.ui.toast('컨텍스트를 압축했어요')
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      $.ui.log(`usage-mods: compact refused: ${message}`, { to: 'debug' })
-      if (isHeadlessRefusal(message)) {
-        // The desktop app and other SDK hosts compact only inside a turn: send /compact as the person's prompt.
-        await $.prompt.submit({ text: '/compact', asUser: true })
-        $.ui.log('usage-mods: sent /compact', { to: 'debug' })
-        $.ui.toast('압축을 시작했어요')
+      const message = errorMessage(error)
+      trace($, `compact refused: ${message}`)
+      if (shouldSendCompact(message, isInteractive)) {
+        sendCompact($, u?.contextPercent ?? 0)
+        isWaiting = true
       } else {
         $.ui.toast(`압축하지 못했어요: ${message}`)
       }
-    } finally {
-      await update($, isCompacting, () => false)
     }
   } finally {
+    if (!isWaiting) {
+      await update($, isCompacting, () => false)
+    }
     isBusy = false
   }
 }
 
 const startCompact = ($: EngineInterface) => {
-  if (isBusy) {
+  if (isBusy || waiting !== null) {
     return
   }
   isBusy = true
@@ -160,6 +278,11 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    isInteractive = e.isInteractive
+    trace($, `session started: surface ${e.surface}, interactive ${e.isInteractive}`)
+    // A reload drops the module's waiting /compact, so the band starts out of it.
+    await update($, isCompacting, () => false)
+    await update($, isTurnRunning, () => false)
     const u = await $.session.usage()
     await update($, usage, () => toUsage(u))
     await tick($)
@@ -172,18 +295,77 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // The plugin's own record of a running turn, beside the band's isWorking: the button is off while either says so.
+  on('turn.start', async ($, e, next) => {
+    await update($, isTurnRunning, () => true)
+    if (waiting !== null) {
+      trace($, `turn started while /compact waits: ${describePrompt(e.text)}`)
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined) {
+      await update($, isTurnRunning, () => false)
+      if (waiting !== null) {
+        trace($, `turn ended (${e.reason}) while /compact waits`)
+      }
+    }
+    return result
+  })
+
+  // Every compaction of the main conversation: the one a /compact the band sent waits for.
+  on('session.compact', async ($, e, next) => {
+    if (e.agentId !== undefined || e.trigger === 'precompute') {
+      return next(e)
+    }
+    trace($, `compaction starting (trigger ${e.trigger})`)
+    const result = await next(e).catch(async error => {
+      const message = errorMessage(error)
+      trace($, `compaction failed (trigger ${e.trigger}): ${message}`)
+      await finishWaiting($, `압축하지 못했어요: ${message}`)
+      throw error
+    })
+    if (result.skip !== undefined) {
+      trace($, `compaction skipped (trigger ${e.trigger}): ${result.skip}`)
+      await finishWaiting($, `압축하지 않았어요: ${result.skip}`)
+    } else {
+      trace($, `compaction done (trigger ${e.trigger}): ${result.tokensBefore} → ${result.tokensAfter} tokens`)
+      await finishWaiting($, '컨텍스트를 압축했어요')
+    }
+    return result
+  }).catch(($, e, next) => next(e))
+
+  // Trace only: what became of a /compact, the band's or typed, and of prompts sent while it waits.
+  on('prompt.submit', async ($, e, next) => {
+    const result = await next(e)
+    if (waiting !== null || e.text.trim() === '/compact') {
+      const outcome = result.drop === undefined ? 'entered' : `dropped: ${result.drop}`
+      trace($, `prompt from ${e.origin.kind}: ${describePrompt(e.text)}, ${outcome}`)
+    }
+    return result
+  }).catch(($, e, next) => next(e))
+
+  on('command.run', { command: 'compact' }, async ($, e, next) => {
+    trace($, `/compact command from ${e.origin.kind}`)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const u = await read($, usage)
     if (e.props.hasSurvey || u === null) {
       return next(e)
     }
+    lastIsWorking = e.props.isWorking // compaction trace
 
     const rows = meters(u)
     const hasReset = u.limits.some(l => l.resetsAt !== undefined)
     const now = hasReset ? (await read($, clockNow)) || (await $.clock.now()) : 0
     const reset = weeklyReset(u, now)
     const compacting = await read($, isCompacting)
-    const isEnabled = canCompact(u, e.props.isWorking, compacting)
+    const turnRunning = await read($, isTurnRunning)
+    const isEnabled = canCompact(u, e.props.isWorking || turnRunning, compacting)
     const { Box, Button, Text } = $.ui.resolve(e)
 
     const meter = (m: Meter) => {
@@ -201,7 +383,8 @@ export const register: Register = on => {
       )
     }
 
-    const [context, ...limits] = rows
+    // meters() always leads with the context meter.
+    const [context, ...limits] = rows as [Meter, ...Meter[]]
 
     return (
       <Box flexDirection="row">
