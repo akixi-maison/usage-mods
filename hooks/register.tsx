@@ -76,10 +76,18 @@ export const weeklyReset = (u: Usage, now: number): string | null => {
   return resetsAt === undefined ? null : `초기화까지 ${timeLeft(resetsAt, now)}`
 }
 
-/** What hovering a meter shows: the percent, and for the 5-hour window when it resets. */
+export type Hover = { percent: string; reset?: string }
+
+/** What hovering a meter shows: the percent, and when its window resets where it has a reset time. */
+export const hoverParts = (u: Usage, m: Meter, now: number): Hover => {
+  const resetsAt = u.limits.find(l => l.kind === m.key)?.resetsAt
+  return { percent: `${m.percent}%`, reset: resetsAt === undefined ? undefined : `${timeLeft(resetsAt, now)} 후 재설정` }
+}
+
+/** The hover as one line, `23% · 2시간 13분 후 재설정`. */
 export const hoverText = (u: Usage, m: Meter, now: number): string => {
-  const resetsAt = m.key === 'five_hour' ? u.limits.find(l => l.kind === 'five_hour')?.resetsAt : undefined
-  return resetsAt === undefined ? `${m.percent}%` : `${m.percent}% · ${timeLeft(resetsAt, now)} 후 재설정`
+  const { percent, reset } = hoverParts(u, m, now)
+  return reset === undefined ? percent : `${percent} · ${reset}`
 }
 
 // Moves the clock the countdown reads, so the band redraws once a minute.
@@ -368,6 +376,20 @@ export const register: Register = on => {
     const isEnabled = canCompact(u, e.props.isWorking || turnRunning, compacting)
     const { Box, Button, Text } = $.ui.resolve(e)
 
+    // The terminal lays the hover over the bar's own cells, reversed; the desktop draws the hover Box
+    // as a card of its own above the band, where reversed text reads as a highlighter mark.
+    const hoverCard = (m: Meter, color: ReturnType<typeof meterColor>) => {
+      const { percent, reset } = hoverParts(u, m, now)
+      return e.surface === 'terminal' ? (
+        <Text bold inverse color={color}>{center(hoverText(u, m, now))}</Text>
+      ) : (
+        <Box flexDirection="row">
+          <Text bold color={color}>{percent}</Text>
+          {reset === undefined ? null : <Text dimColor>{` · ${reset}`}</Text>}
+        </Box>
+      )
+    }
+
     const meter = (m: Meter) => {
       const color = meterColor(m.percent)
       return (
@@ -376,7 +398,7 @@ export const register: Register = on => {
           <Box key={`${m.key}-bar`}>
             <Text color={color}>{bar(m.percent)}</Text>
             <Box position="absolute" top={0} left={0} display="none" hover={{ display: 'flex' }}>
-              <Text bold inverse color={color}>{center(hoverText(u, m, now))}</Text>
+              {hoverCard(m, color)}
             </Box>
           </Box>
         </Box>

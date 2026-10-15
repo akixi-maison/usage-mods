@@ -7,6 +7,7 @@ import {
   canCompact,
   describePrompt,
   hasCompacted,
+  hoverParts,
   hoverText,
   isHeadlessRefusal,
   LOG_FILE,
@@ -175,34 +176,57 @@ test('draws the countdown after the cost and moves it every minute', async ($, o
   await ui.unmount()
 })
 
-test('hovering the 5-hour meter tells when it resets, with the 7-day countdown rules', async () => {
+test('hovering a limit meter tells when it resets, with the 7-day countdown rules', async () => {
   const u = {
+    contextPercent: 30,
     limits: [
       { kind: 'five_hour', percentUsed: 23, resetsAt: '2026-10-11T08:13:00Z' },
       { kind: 'seven_day', percentUsed: 40, resetsAt: RESETS_AT },
     ],
   }
-  const [, five, seven] = meters(u)
+  const [context, five, seven] = meters(u)
   expect(hoverText(u, five!, NOW)).toBe('23% · 2시간 13분 후 재설정')
   expect(hoverText(u, five!, NOW + 2 * 3600_000)).toBe('23% · 13분 후 재설정')
-  expect(hoverText(u, seven!, NOW)).toBe('40%')
+  expect(hoverText(u, seven!, NOW)).toBe('40% · 3일 0시간 후 재설정')
+  expect(hoverParts(u, seven!, NOW)).toEqual({ percent: '40%', reset: '3일 0시간 후 재설정' })
+  expect(hoverText(u, context!, NOW)).toBe('30%')
   expect(hoverText({ limits: [{ kind: 'five_hour', percentUsed: 23 }] }, five!, NOW)).toBe('23%')
 })
 
-test('draws the 5-hour reset time in the hover card', async ($, on) => {
+const RESET_MEASURE = {
+  context: { window: 200000, tokens: 60000, percent: 30 },
+  rateLimits: [
+    { kind: 'five_hour', percentUsed: 23, resetsAt: '2026-10-11T08:13:00Z' },
+    { kind: 'seven_day', percentUsed: 40, resetsAt: RESETS_AT },
+  ],
+  changed: ['context', 'rateLimits'] as ('context' | 'rateLimits')[],
+}
+
+test('the terminal reverses the hover over the bar cells', async ($, on) => {
   mock.clock(on, { now: NOW })
   on('session.measure', ($, e) => ({ changed: e.changed }))
-  await $.session.measure({
-    context: { window: 200000, tokens: 60000, percent: 30 },
-    rateLimits: [{ kind: 'five_hour', percentUsed: 23, resetsAt: '2026-10-11T08:13:00Z' }],
-    changed: ['context', 'rateLimits'],
-  })
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
-    expect(await ui.find({ type: 'Text', text: '23% · 2시간 13분 후 재설정' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /^ *30% *$/ })).toBeDefined()
-    await ui.unmount()
-  }
+  await $.session.measure(RESET_MEASURE)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
+  expect((await ui.find({ type: 'Text', text: '23% · 2시간 13분 후 재설정' }))?.props.inverse).toBe(true)
+  expect(await ui.find({ type: 'Text', text: '40% · 3일 0시간 후 재설정' })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /^ *30% *$/ }))?.props.inverse).toBe(true)
+  await ui.unmount()
+})
+
+test('the desktop hover card holds plain text: the percent in its color, then when it resets', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  await $.session.measure(RESET_MEASURE)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  const percent = await ui.find({ type: 'Text', text: '23%' })
+  expect(percent?.props).toMatchObject({ bold: true, color: 'green' })
+  expect(percent?.props.inverse).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: ' · 2시간 13분 후 재설정' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: ' · 3일 0시간 후 재설정' })).toBeDefined()
+  // No padding to the bar's width around a short percent.
+  expect(await ui.find({ type: 'Text', text: '30%' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ +30%/ })).toBeUndefined()
+  await ui.unmount()
 })
 
 test('recognises the desktop app refusing to compact outside a turn', async () => {
