@@ -81,10 +81,10 @@ export type Hover = { percent: string; reset?: string }
 /** What hovering a meter shows: the percent, and when its window resets where it has a reset time. */
 export const hoverParts = (u: Usage, m: Meter, now: number): Hover => {
   const resetsAt = u.limits.find(l => l.kind === m.key)?.resetsAt
-  return { percent: `${m.percent}%`, reset: resetsAt === undefined ? undefined : `${timeLeft(resetsAt, now)} 후 재설정` }
+  return { percent: `${m.percent}%`, reset: resetsAt === undefined ? undefined : `${timeLeft(resetsAt, now)} 후 초기화` }
 }
 
-/** The hover as one line, `23% · 2시간 13분 후 재설정`. */
+/** The hover as one line, `23% · 2시간 13분 후 초기화`. */
 export const hoverText = (u: Usage, m: Meter, now: number): string => {
   const { percent, reset } = hoverParts(u, m, now)
   return reset === undefined ? percent : `${percent} · ${reset}`
@@ -392,6 +392,8 @@ export const register: Register = on => {
 
     const meter = (m: Meter) => {
       const color = meterColor(m.percent)
+      // The weekly countdown sits beside the 7-day bar it belongs to.
+      const after = m.key === 'seven_day' ? reset : null
       return (
         <Box key={m.key} flexDirection="row" marginRight={2}>
           <Text dimColor>{m.label} </Text>
@@ -401,6 +403,7 @@ export const register: Register = on => {
               {hoverCard(m, color)}
             </Box>
           </Box>
+          {after === null ? null : <Text dimColor> {after}</Text>}
         </Box>
       )
     }
@@ -425,7 +428,6 @@ export const register: Register = on => {
             <Text dimColor>${u.usd.toFixed(2)}</Text>
           </Box>
         )}
-        {reset === null ? null : <Text dimColor>{reset}</Text>}
       </Box>
     )
   })

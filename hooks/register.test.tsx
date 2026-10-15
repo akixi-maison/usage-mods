@@ -152,7 +152,7 @@ test('counts down to the 7-day reset in days, then hours, then minutes', async (
   expect(weeklyReset({ limits: [] }, NOW)).toBeNull()
 })
 
-test('draws the countdown after the cost and moves it every minute', async ($, on) => {
+test('draws the countdown beside the 7-day bar, before the cost, and moves it every minute', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
@@ -167,12 +167,15 @@ test('draws the countdown after the cost and moves it every minute', async ($, o
   await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
-    expect(await ui.find({ type: 'Text', text: '초기화까지 3일 0시간' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^ ?초기화까지 3일 0시간$/ })).toBeDefined()
+    expect(JSON.stringify(await ui.find({ key: 'seven_day' }))).toContain('초기화까지 3일 0시간')
+    const drawn = JSON.stringify(await ui.drawn())
+    expect(drawn.indexOf('초기화까지')).toBeLessThan(drawn.indexOf('0.50'))
     await ui.unmount()
   }
   await clock.advance(72 * 3600_000 - 13 * 60_000)
   const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
-  expect(await ui.find({ type: 'Text', text: '초기화까지 13분' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ ?초기화까지 13분$/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -185,10 +188,10 @@ test('hovering a limit meter tells when it resets, with the 7-day countdown rule
     ],
   }
   const [context, five, seven] = meters(u)
-  expect(hoverText(u, five!, NOW)).toBe('23% · 2시간 13분 후 재설정')
-  expect(hoverText(u, five!, NOW + 2 * 3600_000)).toBe('23% · 13분 후 재설정')
-  expect(hoverText(u, seven!, NOW)).toBe('40% · 3일 0시간 후 재설정')
-  expect(hoverParts(u, seven!, NOW)).toEqual({ percent: '40%', reset: '3일 0시간 후 재설정' })
+  expect(hoverText(u, five!, NOW)).toBe('23% · 2시간 13분 후 초기화')
+  expect(hoverText(u, five!, NOW + 2 * 3600_000)).toBe('23% · 13분 후 초기화')
+  expect(hoverText(u, seven!, NOW)).toBe('40% · 3일 0시간 후 초기화')
+  expect(hoverParts(u, seven!, NOW)).toEqual({ percent: '40%', reset: '3일 0시간 후 초기화' })
   expect(hoverText(u, context!, NOW)).toBe('30%')
   expect(hoverText({ limits: [{ kind: 'five_hour', percentUsed: 23 }] }, five!, NOW)).toBe('23%')
 })
@@ -207,8 +210,8 @@ test('the terminal reverses the hover over the bar cells', async ($, on) => {
   on('session.measure', ($, e) => ({ changed: e.changed }))
   await $.session.measure(RESET_MEASURE)
   const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
-  expect((await ui.find({ type: 'Text', text: '23% · 2시간 13분 후 재설정' }))?.props.inverse).toBe(true)
-  expect(await ui.find({ type: 'Text', text: '40% · 3일 0시간 후 재설정' })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: '23% · 2시간 13분 후 초기화' }))?.props.inverse).toBe(true)
+  expect(await ui.find({ type: 'Text', text: '40% · 3일 0시간 후 초기화' })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: /^ *30% *$/ }))?.props.inverse).toBe(true)
   await ui.unmount()
 })
@@ -221,8 +224,8 @@ test('the desktop hover card holds plain text: the percent in its color, then wh
   const percent = await ui.find({ type: 'Text', text: '23%' })
   expect(percent?.props).toMatchObject({ bold: true, color: 'green' })
   expect(percent?.props.inverse).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: ' · 2시간 13분 후 재설정' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: ' · 3일 0시간 후 재설정' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: ' · 2시간 13분 후 초기화' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: ' · 3일 0시간 후 초기화' })).toBeDefined()
   // No padding to the bar's width around a short percent.
   expect(await ui.find({ type: 'Text', text: '30%' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^ +30%/ })).toBeUndefined()
