@@ -30,13 +30,14 @@ export const bar = (percent: number): string => {
   return '█'.repeat(filled) + '░'.repeat(BAR_WIDTH - filled)
 }
 
-export const meterColor = (percent: number): 'red' | 'yellow' | 'green' =>
-  percent >= 90 ? 'red' : percent >= 80 ? 'yellow' : 'green'
+/** The theme's own colors for a meter, so the band follows the person's theme. */
+export const meterColor = (percent: number): 'error' | 'warning' | 'success' =>
+  percent >= 90 ? 'error' : percent >= 80 ? 'warning' : 'success'
 
 // Off the terminal a bar is a picture: a rounded track and its fill, in CSS pixels. A picture cannot
 // follow the theme, so the track is a see-through grey and the fills read on light and dark alike.
 export const BAR_PX = { width: 96, height: 6 }
-const BAR_FILL: Record<ReturnType<typeof meterColor>, string> = { green: '#2f9e57', yellow: '#c27c0e', red: '#d93f3f' }
+const BAR_FILL: Record<ReturnType<typeof meterColor>, string> = { success: '#2f9e57', warning: '#c27c0e', error: '#d93f3f' }
 
 /** The bar as SVG: the fill in proportion, clamped, never thinner than its own height once above 0. */
 export const barSvg = (percent: number, color: ReturnType<typeof meterColor>): string => {
@@ -450,7 +451,6 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="row">
-        <Text dimColor>사용량 </Text>
         {meter(context)}
         <Box key="compact-slot" marginRight={2}>
           {isEnabled ? (

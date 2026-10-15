@@ -37,12 +37,12 @@ test('fills the bar in proportion and clamps it', async () => {
   expect(bar(130)).toBe('██████████')
 })
 
-test('green below 80, yellow from 80, red from 90', async () => {
-  expect(meterColor(79.9)).toBe('green')
-  expect(meterColor(80)).toBe('yellow')
-  expect(meterColor(89.9)).toBe('yellow')
-  expect(meterColor(90)).toBe('red')
-  expect(meterColor(120)).toBe('red')
+test('the theme\'s success below 80, warning from 80, error from 90', async () => {
+  expect(meterColor(79.9)).toBe('success')
+  expect(meterColor(80)).toBe('warning')
+  expect(meterColor(89.9)).toBe('warning')
+  expect(meterColor(90)).toBe('error')
+  expect(meterColor(120)).toBe('error')
 })
 
 test('one meter per known percentage', async () => {
@@ -71,9 +71,10 @@ test('draws bars with the percent hidden until hovered', async ($, on) => {
       expect(await ui.find({ type: 'Text', text: /█|░/ })).toBeUndefined()
       const bars = await ui.findAll({ type: 'Svg' })
       expect(bars.map(b => b.props.alt)).toEqual(['컨텍스트 30%', '7일 85%'])
-      expect(bars[1]?.props).toMatchObject({ source: barSvg(85, 'yellow'), ...BAR_PX })
+      expect(bars[1]?.props).toMatchObject({ source: barSvg(85, 'warning'), ...BAR_PX })
     }
     expect(await ui.find({ key: 'seven_day-bar' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /사용량/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /85%/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /\$0\.50/ })).toBeDefined()
     await ui.unmount()
@@ -82,13 +83,13 @@ test('draws bars with the percent hidden until hovered', async ($, on) => {
 
 test('the desktop bar fills in proportion, clamped, and shows a dot for a little use', async () => {
   const fill = (svg: string) => [...svg.matchAll(/<rect width="([\d.]+)"/g)].map(m => Number(m[1]))
-  expect(fill(barSvg(0, 'green'))).toEqual([96])
-  expect(fill(barSvg(24, 'green'))).toEqual([96, 23])
-  expect(fill(barSvg(1, 'green'))).toEqual([96, 6])
-  expect(fill(barSvg(100, 'red'))).toEqual([96, 96])
-  expect(fill(barSvg(130, 'red'))).toEqual([96, 96])
-  expect(barSvg(24, 'green')).toContain('fill="#2f9e57"')
-  expect(barSvg(95, 'red')).toContain('fill="#d93f3f"')
+  expect(fill(barSvg(0, 'success'))).toEqual([96])
+  expect(fill(barSvg(24, 'success'))).toEqual([96, 23])
+  expect(fill(barSvg(1, 'success'))).toEqual([96, 6])
+  expect(fill(barSvg(100, 'error'))).toEqual([96, 96])
+  expect(fill(barSvg(130, 'error'))).toEqual([96, 96])
+  expect(barSvg(24, 'success')).toContain('fill="#2f9e57"')
+  expect(barSvg(95, 'error')).toContain('fill="#d93f3f"')
 })
 
 const MEASURE = {
@@ -268,7 +269,7 @@ test('the desktop hover card holds plain text: the percent in its color, then wh
   await $.session.measure(RESET_MEASURE)
   const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
   const percent = await ui.find({ type: 'Text', text: '23%' })
-  expect(percent?.props).toMatchObject({ bold: true, color: 'green' })
+  expect(percent?.props).toMatchObject({ bold: true, color: 'success' })
   expect(percent?.props.inverse).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: ' · 2시간 13분 후 초기화' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: ' · 3일 0시간 후 초기화' })).toBeDefined()
