@@ -97,6 +97,14 @@ export const weeklyReset = (u: Usage, now: number): string | null => {
   return resetsAt === undefined ? null : `초기화까지 ${timeLeft(resetsAt, now)}`
 }
 
+/** Whether the account has a subscription's 5-hour or 7-day limits, which are what bound its use. */
+export const isSubscription = (u: Usage): boolean =>
+  u.limits.some(l => l.kind === 'five_hour' || l.kind === 'seven_day')
+
+/** `$0.50`, the session's cost at API prices; null on a subscription, which is not billed by it. */
+export const costText = (u: Usage): string | null =>
+  u.usd === undefined || isSubscription(u) ? null : `$${u.usd.toFixed(2)}`
+
 export type Hover = { percent: string; reset?: string }
 
 /** What hovering a meter shows: the percent, and when its window resets where it has a reset time. */
@@ -402,6 +410,7 @@ export const register: Register = on => {
     const hasReset = u.limits.some(l => l.resetsAt !== undefined)
     const now = hasReset ? (await read($, clockNow)) || (await $.clock.now()) : 0
     const reset = weeklyReset(u, now)
+    const cost = costText(u)
     const compacting = await read($, isCompacting)
     const turnRunning = await read($, isTurnRunning)
     const isEnabled = canCompact(u, e.props.isWorking || turnRunning, compacting)
@@ -466,9 +475,9 @@ export const register: Register = on => {
           )}
         </Box>
         {limits.map(meter)}
-        {u.usd === undefined ? null : (
+        {cost === null ? null : (
           <Box key="usd" marginRight={2}>
-            <Text dimColor>${u.usd.toFixed(2)}</Text>
+            <Text dimColor>{cost}</Text>
           </Box>
         )}
       </Box>

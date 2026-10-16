@@ -7,6 +7,7 @@ import {
   BAR_PX,
   barSvg,
   canCompact,
+  costText,
   describePrompt,
   hasCompacted,
   hoverParts,
@@ -76,7 +77,8 @@ test('draws bars with the percent hidden until hovered', async ($, on) => {
     expect(await ui.find({ key: 'seven_day-bar' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /사용량/ })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /85%/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /\$0\.50/ })).toBeDefined()
+    // A subscription (the 7-day limit) is not billed by the cost, so it is left out.
+    expect(await ui.find({ type: 'Text', text: /\$0\.50/ })).toBeUndefined()
     await ui.unmount()
   }
 })
@@ -199,7 +201,7 @@ test('counts down to the 7-day reset in days, then hours, then minutes', async (
   expect(weeklyReset({ limits: [] }, NOW)).toBeNull()
 })
 
-test('draws the countdown beside the 7-day bar, before the cost, and moves it every minute', async ($, on) => {
+test('draws the countdown beside the 7-day bar, with no cost on a subscription, and moves it every minute', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
@@ -217,7 +219,7 @@ test('draws the countdown beside the 7-day bar, before the cost, and moves it ev
     expect(await ui.find({ type: 'Text', text: /^ ?초기화까지 3일 0시간$/ })).toBeDefined()
     expect(JSON.stringify(await ui.find({ key: 'seven_day' }))).toContain('초기화까지 3일 0시간')
     const drawn = JSON.stringify(await ui.drawn())
-    expect(drawn.indexOf('초기화까지')).toBeLessThan(drawn.indexOf('0.50'))
+    expect(drawn).not.toContain('0.50')
     await ui.unmount()
   }
   await clock.advance(72 * 3600_000 - 13 * 60_000)
@@ -495,4 +497,34 @@ test('each step of a press is written to the trace file under HOME', async ($, o
   expect(new Set(paths)).toEqual(new Set([`/home/someone/${LOG_FILE}`]))
   expect(file).toMatch(/pressed: band isWorking=false, turn running=false, context=30%\n.*declined\n$/)
   await ui.unmount()
+})
+
+test('the cost shows only where no subscription limit bounds the use', async () => {
+  expect(costText({ usd: 0.5, limits: [] })).toBe('$0.50')
+  expect(costText({ usd: 0.5, limits: [{ kind: 'spend_limit', percentUsed: 10 }] })).toBe('$0.50')
+  expect(costText({ usd: 0.5, limits: [{ kind: 'five_hour', percentUsed: 10 }] })).toBeNull()
+  expect(costText({ usd: 0.5, limits: [{ kind: 'seven_day', percentUsed: 10 }] })).toBeNull()
+  expect(costText({ limits: [] })).toBeNull()
+})
+
+test('draws the cost for an API key and leaves it out on a subscription', async ($, on) => {
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  const context = { window: 200000, tokens: 60000, percent: 30 }
+  await $.session.measure({ context, rateLimits: [], cost: { usd: 0.5 }, changed: ['context', 'rateLimits', 'cost'] })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
+    expect(await ui.find({ type: 'Text', text: '$0.50' })).toBeDefined()
+    await ui.unmount()
+  }
+  await $.session.measure({
+    context,
+    rateLimits: [{ kind: 'five_hour', percentUsed: 20 }],
+    cost: { usd: 0.5 },
+    changed: ['rateLimits'],
+  })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
+    expect(await ui.find({ type: 'Text', text: '$0.50' })).toBeUndefined()
+    await ui.unmount()
+  }
 })
