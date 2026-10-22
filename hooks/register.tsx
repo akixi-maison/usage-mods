@@ -359,10 +359,18 @@ const startHelperTurn = async ($: EngineInterface, agentId: string) => {
   startWorkTicker($)
 }
 
+// A helper's turn can end while it still waits on background work of its own: the tasks list keeps
+// it busy, and it stays counted (and the ticker running) until the list lets go of it.
 const endHelperTurn = async ($: EngineInterface, agentId: string) => {
   await update($, helperTurns, list => list.filter(id => id !== agentId))
-  await update($, helpers, list => list.filter(id => id !== agentId))
   await update($, helperAsks, list => list.filter(ask => ask.agentId !== agentId))
+  const isStillBusy = await $.agent.list().then(
+    list => list.some(agent => agent.id === agentId && isBusyAgent(agent)),
+    () => false,
+  )
+  if (!isStillBusy) {
+    await update($, helpers, list => list.filter(id => id !== agentId))
+  }
 }
 
 // Waits a moment first: a turn that starts right away (a queued prompt) makes the news stale.

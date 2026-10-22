@@ -1,3 +1,4 @@
+import type { AgentInfo } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
@@ -620,14 +621,19 @@ test('a teammate in a pane of its own is not counted as at work', async () => {
 
 // The engine's side of a turn: the clock, the agents, the notification channel, and tool calls
 // that run until the test finishes them.
-const workWorld = (on: TestArgs[1], now = T0) => {
+type WorldOptions = {
+  now?: number
+  /** What the tasks list says, asked afresh each time. */
+  agents?: () => AgentInfo[]
+}
+const workWorld = (on: TestArgs[1], { now = T0, agents = () => [] }: WorldOptions = {}) => {
   const clock = mock.clock(on, { now })
   const toasts: string[] = []
   const finishers: Array<() => void> = []
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
-  on('agent.list', () => ({ value: [] }))
+  on('agent.list', () => ({ value: agents() }))
   on('ui.notify', () => ({ value: { isSent: false, reason: 'no-surface' } }))
   on('ui.toast', ($, e) => {
     toasts.push(e.text)
@@ -751,6 +757,29 @@ test('a helper\'s settled call lets go of its own ask only, not another call\'s 
   const after = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
   expect((await statusTexts(after))[0]).toMatch(/^[●○] 작업 중/)
   await after.unmount()
+})
+
+test('a helper whose turn ended but still waits on its own background work stays in the band', async ($, on) => {
+  let status: AgentInfo['status'] = 'waiting'
+  const world = workWorld(on, { agents: () => [{ id: 'agent-1', description: 'watch the build', type: 'general-purpose', status }] })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'go', turnId: 'main' })
+  await $.turn.start({ text: 'sub', turnId: 'sub', agentId: 'agent-1' })
+  await $.turn.complete({ answer: 'done', durationMs: 5_000, isAborted: false, turnId: 'main', reason: 'answer' })
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 'sub', agentId: 'agent-1', reason: 'answer' })
+  await world.clock.advance(5_000)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
+    expect(JSON.stringify(await ui.drawn())).toMatch(/[●○] 백그라운드 도우미 1명은 아직 일하는 중/)
+    await ui.unmount()
+  }
+
+  // Once the list says it is done, the next tick lets go of it.
+  status = 'completed'
+  await world.clock.advance(1_000)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  expect(JSON.stringify(await ui.drawn())).not.toContain('백그라운드 도우미')
+  await ui.unmount()
 })
 
 test('a helper\'s turn leaves the compact button as the main loop left it', async ($, on) => {
