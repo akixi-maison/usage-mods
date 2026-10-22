@@ -60,6 +60,9 @@ export type Schedule = {
   seenAt: number
 }
 
+/** What started the main turn when not the person: a notification ('task'), a stored prompt ('schedule'). */
+export type Trigger = '' | 'task' | 'schedule'
+
 export type Work = {
   phase: Phase
   /** Epoch ms the main turn started; 0 when not known. */
@@ -71,6 +74,8 @@ export type Work = {
   running: RunningTool[]
   /** Why a turn that stopped short stopped. */
   stopReason: '' | 'refusal' | 'error'
+  /** What started the turn; absent in a status stored before it was kept, and read as ''. */
+  trigger?: Trigger
 }
 
 declare module 'claude-code' {

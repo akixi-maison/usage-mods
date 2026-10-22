@@ -11,7 +11,7 @@ import type {
   TurnCompleteInput,
 } from 'claude-code'
 
-import type { BackgroundKind, BackgroundTask, HelperAsk, Phase, RunningTool, Schedule, Usage, Work } from '../types'
+import type { BackgroundKind, BackgroundTask, HelperAsk, Phase, RunningTool, Schedule, Trigger, Usage, Work } from '../types'
 
 const IDLE_WORK: Work = { phase: 'idle', startedAt: 0, durationMs: 0, tools: 0, running: [], stopReason: '' }
 
@@ -509,8 +509,9 @@ export const statusRows = (s: StatusInput): StatusRow[] => {
       ]
     }
 
+    const doing = w.trigger === 'task' ? '알림 받고 작업 중' : w.trigger === 'schedule' ? '예약 작업 중' : '작업 중'
     const head = [
-      `${lead}${dot} 작업 중`,
+      `${lead}${dot} ${doing}`,
       w.startedAt > 0 ? elapsed(s.now - w.startedAt) : '',
       w.tools > 0 ? `도구 ${w.tools}회` : '',
       s.helpers > 0 ? `도우미 ${s.helpers}명 일하는 중` : '',
@@ -608,10 +609,24 @@ const startWorkTicker = ($: EngineInterface) => {
   workTicker ??= $.clock.every(1000, () => void workTick($))
 }
 
-const startMainTurn = async ($: EngineInterface) => {
+// What started the turn about to start, between the prompt's submission and the turn's start; the
+// module's own, so a reload mid-way only loses the words.
+let pendingTrigger: Trigger = ''
+
+/** The trigger for a prompt that opens a turn of its own (none while one runs): a notification or a stored prompt. */
+export const triggerOf = (kind: string, turnId: string | undefined): Trigger =>
+  turnId !== undefined ? '' : kind === 'task-notification' ? 'task' : kind === 'scheduled-trigger' ? 'schedule' : ''
+
+const takeTrigger = (): Trigger => {
+  const trigger = pendingTrigger
+  pendingTrigger = ''
+  return trigger
+}
+
+const startMainTurn = async ($: EngineInterface, trigger: Trigger) => {
   const at = await $.clock.now()
   await update($, clockNow, () => at)
-  await update($, work, () => ({ ...IDLE_WORK, phase: 'working', startedAt: at }))
+  await update($, work, () => ({ ...IDLE_WORK, phase: 'working', startedAt: at, trigger }))
   startWorkTicker($)
 }
 
@@ -655,8 +670,10 @@ const announceEnd = async ($: EngineInterface, text: string) => {
 const endMainTurn = async ($: EngineInterface, e: TurnCompleteInput) => {
   const phase: Phase = e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? 'aborted' : 'error'
   const stopReason: Work['stopReason'] = e.reason === 'refusal' ? 'refusal' : e.reason === 'error' ? 'error' : ''
+  const { trigger } = await read($, work)
   await update($, work, w => ({ ...w, phase, durationMs: e.durationMs, running: [], stopReason }))
-  if (phase !== 'aborted' && e.durationMs >= ANNOUNCE_AFTER_MS) {
+  // A schedule's turns come every few minutes on their own: none is announced.
+  if (phase !== 'aborted' && e.durationMs >= ANNOUNCE_AFTER_MS && trigger !== 'schedule') {
     const text = phase === 'done' ? `작업이 끝났어요 (${elapsed(e.durationMs)} 걸림)` : '작업이 멈췄어요'
     $.clock.after(2000, () => void announceEnd($, text))
   }
@@ -787,6 +804,7 @@ const resetWork = async ($: EngineInterface) => {
   await update($, schedules, () => [])
   scheduleTimer?.cancel()
   scheduleTimer = undefined
+  pendingTrigger = ''
 }
 
 // After a reload mid-turn the stored status stands, and its ticker starts again.
@@ -1092,7 +1110,7 @@ export const register: Register = on => {
     if (waiting !== null) {
       trace($, `turn started while /compact waits: ${describePrompt(e.text)}`)
     }
-    await quietly(e.agentId === undefined ? startMainTurn($) : startHelperTurn($, e.agentId))
+    await quietly(e.agentId === undefined ? startMainTurn($, takeTrigger()) : startHelperTurn($, e.agentId))
     return next(e)
   })
 
@@ -1140,12 +1158,19 @@ export const register: Register = on => {
     } else if (e.origin.kind === 'scheduled-trigger') {
       await quietly(fireStored($, e.text))
     }
-    const result = await next(e)
-    if (waiting !== null || e.text.trim() === '/compact') {
-      const outcome = result.drop === undefined ? 'entered' : `dropped: ${result.drop}`
-      trace($, `prompt from ${e.origin.kind}: ${describePrompt(e.text)}, ${outcome}`)
+    // `next(e)` resolves once the prompt's turn has started, so the turn's start reads what started it.
+    pendingTrigger = triggerOf(e.origin.kind, e.turnId)
+    try {
+      const result = await next(e)
+      if (waiting !== null || e.text.trim() === '/compact') {
+        const outcome = result.drop === undefined ? 'entered' : `dropped: ${result.drop}`
+        trace($, `prompt from ${e.origin.kind}: ${describePrompt(e.text)}, ${outcome}`)
+      }
+      return result
+    } finally {
+      // Dropped, or queued behind a running turn: whatever starts next was not started by this.
+      pendingTrigger = ''
     }
-    return result
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'compact' }, async ($, e, next) => {
