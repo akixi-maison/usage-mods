@@ -698,6 +698,11 @@ test('a stop\'s snapshot drops what ended unannounced and adds what the band did
   const watched = reconcileTasks([], [{ id: 'm5', type: 'shell', status: 'running', description: 'Watch the log', command: 'tail -f app.log' }], at, new Map([['m5', 'monitor' as const]]))
   expect(watched).toEqual([{ id: 'm5', kind: 'monitor', label: '지켜보기', detail: 'Watch the log', startedAt: 0, endsBy: 0, seenAt: at }])
   expect(reconcileTasks([], [{ id: 'a9', type: 'subagent', status: 'running', description: '' }], at, new Map([['a9', 'monitor' as const]]))).toEqual([])
+  // Seen in a snapshot first as a 'shell', its kind learned after: the next snapshot corrects it.
+  const early = reconcileTasks([], [{ id: 'm6', type: 'shell', status: 'running', description: 'Watch CI', command: 'gh run watch' }], at)
+  expect(early[0]?.label).toBe('명령 실행')
+  const corrected = reconcileTasks(early, [{ id: 'm6', type: 'shell', status: 'running', description: 'Watch CI', command: 'gh run watch' }], at + MIN, new Map([['m6', 'monitor' as const]]))
+  expect(corrected).toEqual([{ ...early[0]!, kind: 'monitor', label: '지켜보기' }])
 })
 
 test('the background rows: one task with its time, several by kind, helpers keeping their dot', async () => {

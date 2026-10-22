@@ -313,7 +313,13 @@ export const reconcileTasks = (
   kinds: ReadonlyMap<string, BackgroundKind> = new Map(),
 ): BackgroundTask[] => {
   const listed = new Set(snapshot.map(one => one.id))
-  const kept = tracked.filter(task => listed.has(task.id) || at - task.seenAt < SNAPSHOT_GRACE_MS)
+  const kept = tracked
+    .filter(task => listed.has(task.id) || at - task.seenAt < SNAPSHOT_GRACE_MS)
+    .map(task => {
+      // One first seen in a snapshot, before the mod learned its kind from its start: corrected now.
+      const kind = task.startedAt === 0 ? kinds.get(task.id) : undefined
+      return kind === undefined || kind === task.kind ? task : { ...task, kind, label: KIND_LABELS[kind] }
+    })
   const known = new Set(kept.map(task => task.id))
   const added = snapshot.flatMap((one): BackgroundTask[] => {
     const kind = SNAPSHOT_KINDS[one.type] === undefined ? undefined : kinds.get(one.id) ?? SNAPSHOT_KINDS[one.type]
