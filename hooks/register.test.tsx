@@ -1129,7 +1129,7 @@ test('TaskStop, a stop\'s snapshot and a /clear each let go of background work',
   expect(await shown()).toContain('◌ 백그라운드: 명령 실행 — npm run watch')
   expect(await shown()).not.toContain('— two')
 
-  await $.session.end({ reason: 'clear' })
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's2' } })
   expect(await shown()).not.toContain('백그라운드')
 })
 
@@ -1234,7 +1234,7 @@ test('a stop\'s snapshot names a wakeup by its job and brings back schedules aft
   await $.classic.Stop({ stop_hook_active: false, session_crons: crons })
   expect(await bandText($)).toContain('◷ 4분 후 실행 · watching the build')
 
-  await $.session.end({ reason: 'clear' })
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's2' } })
   expect(await bandText($)).not.toContain('◷')
   await $.classic.Stop({ stop_hook_active: false, session_crons: [{ id: 'c9', schedule: '0 * * * *', recurring: true, prompt: 'hourly report' }] })
   expect(await bandText($)).toContain('◷ 반복 예약 · hourly report')
