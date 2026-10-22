@@ -207,7 +207,8 @@ test('counts down to the 7-day reset in days, then hours, then minutes', async (
   expect(weeklyReset({ limits: [] }, NOW)).toBeNull()
 })
 
-test('draws the countdown beside the 7-day bar, with no cost on a subscription, and moves it every minute', async ($, on) => {
+// Three days of minute ticks run one by one on the mocked clock: more than the default 5 s.
+test('draws the countdown beside the 7-day bar, with no cost on a subscription, and moves it every minute', { timeoutMs: 60_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
