@@ -1,17 +1,22 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
+import type { Work } from '../types'
 import {
   appendLine,
+  ASK_FRESH_MS,
   bar,
   BAR_PX,
   barSvg,
   canCompact,
   costText,
   describePrompt,
+  describeTool,
+  elapsed,
   hasCompacted,
   hoverParts,
   hoverText,
+  isBusyAgent,
   isHeadlessRefusal,
   LOG_FILE,
   meterColor,
@@ -19,6 +24,7 @@ import {
   OFF_HINT,
   QUEUE_TIMEOUT,
   shouldSendCompact,
+  statusRows,
   weeklyReset,
 } from './register'
 
@@ -527,4 +533,231 @@ test('draws the cost for an API key and leaves it out on a subscription', async 
     expect(await ui.find({ type: 'Text', text: '$0.50' })).toBeUndefined()
     await ui.unmount()
   }
+})
+
+// --- Work status --------------------------------------------------------------------------------
+
+test('a tool call in plain words: what it does and what it works on', async () => {
+  expect(describeTool('Bash', { command: 'npm test', description: 'Run tests' })).toEqual({ label: '명령 실행', detail: 'Run tests', needsMe: false })
+  expect(describeTool('Bash', { command: 'npm   test\n--watch' }).detail).toBe('npm test --watch')
+  expect(describeTool('Edit', { file_path: 'C:\\work\\src\\app.tsx' }).detail).toBe('app.tsx')
+  expect(describeTool('WebFetch', { url: 'https://example.com/a/b' }).detail).toBe('example.com')
+  expect(describeTool('AskUserQuestion', {})).toEqual({ label: '질문에 답해 주세요', detail: '', needsMe: true })
+  expect(describeTool('mcp__ccd_turn__update_plan', {}).label).toBe('도구 사용: update_plan')
+  expect(describeTool('Mystery', null).label).toBe('도구 사용: Mystery')
+})
+
+test('elapsed time in seconds, then minutes, then hours', async () => {
+  expect(elapsed(0)).toBe('0초')
+  expect(elapsed(45_400)).toBe('45초')
+  expect(elapsed(60_000)).toBe('1분')
+  expect(elapsed(83_000)).toBe('1분 23초')
+  expect(elapsed(3_720_000)).toBe('1시간 2분')
+  expect(elapsed(-5)).toBe('0초')
+})
+
+const T0 = 1_000_000
+const WORKING: Work = { phase: 'working', startedAt: T0, durationMs: 0, tools: 0, running: [], stopReason: '' }
+const STATUS = { work: WORKING, isWorking: true, now: T0, beat: true, helpers: 0, helperAsks: [], isViewingHelper: false }
+const call = (over: Partial<Work['running'][number]> = {}) => ({
+  id: 'c1', tool: 'Bash', label: '명령 실행', detail: 'Run tests', needsMe: false, startedAt: T0, askedAt: null, ...over,
+})
+const texts = (rows: { text: string }[]) => rows.map(r => r.text)
+
+test('the status rows while the main turn works', async () => {
+  expect(statusRows({ ...STATUS, work: { ...WORKING, phase: 'idle' }, isWorking: false })).toEqual([])
+  expect(texts(statusRows({ ...STATUS, now: T0 + 83_000 }))).toEqual(['● 작업 중 · 1분 23초', '생각하거나 답을 쓰는 중…'])
+  const busy = { ...WORKING, tools: 7, running: [call({ startedAt: T0 + 68_000 }), call({ id: 'c2' })] }
+  const rows = statusRows({ ...STATUS, work: busy, now: T0 + 83_000, beat: false, helpers: 2 })
+  expect(texts(rows)).toEqual(['○ 작업 중 · 1분 23초 · 도구 7회 · 도우미 2명 일하는 중', '지금 (15초째): 명령 실행 — Run tests 외 1개'])
+  expect(rows.map(r => r.tone)).toEqual(['claude', 'dim'])
+  // Loaded mid-turn: the engine says it works, the mod knows nothing more.
+  expect(texts(statusRows({ ...STATUS, work: { ...WORKING, phase: 'idle' } }))).toEqual(['작업 중…'])
+  expect(texts(statusRows({ ...STATUS, isViewingHelper: true }))[0]).toBe('메인 대화 · ● 작업 중 · 0초')
+})
+
+test('waiting on the person turns the rows yellow and stops the dot', async () => {
+  const asking = { ...WORKING, running: [call({ id: 'q', tool: 'AskUserQuestion', label: '질문에 답해 주세요', detail: '', needsMe: true })] }
+  const rows = statusRows({ ...STATUS, work: asking, now: T0 + 5_000 })
+  expect(texts(rows)).toEqual(['! 나를 기다리는 중 · 5초째', '질문에 답해 주세요'])
+  expect(rows.map(r => r.tone)).toEqual(['warning', 'warning'])
+  // The time is how long it has waited, not how long the turn has run.
+  const late = { ...WORKING, running: [call({ id: 'q', tool: 'AskUserQuestion', label: '질문에 답해 주세요', detail: '', needsMe: true, startedAt: T0 + 180_000 })] }
+  expect(texts(statusRows({ ...STATUS, work: late, now: T0 + 182_000 }))[0]).toBe('! 나를 기다리는 중 · 2초째')
+
+  const asked = { ...WORKING, running: [call({ askedAt: T0 + 5_000 })] }
+  expect(texts(statusRows({ ...STATUS, work: asked, now: T0 + 5_000 }))).toEqual(['! 승인 요청이 떴어요 · 방금', '명령 실행 — Run tests · 승인했다면 실행 중이에요'])
+  expect(texts(statusRows({ ...STATUS, work: asked, now: T0 + 15_000 }))[0]).toBe('! 승인 요청이 떴어요 · 10초 전')
+  // Past the window the call may well be running: a dim note, ahead of the words a narrow band cuts.
+  const stale = statusRows({ ...STATUS, work: asked, now: T0 + 5_000 + ASK_FRESH_MS })
+  expect(texts(stale)).toEqual(['● 작업 중 · 35초', '지금 (35초째, 승인 요청이 떴었어요): 명령 실행 — Run tests'])
+
+  const helperAsk = { agentId: 'a1', tool: 'Bash', label: '명령 실행', detail: 'npm install', at: T0 }
+  expect(texts(statusRows({ ...STATUS, helperAsks: [helperAsk], now: T0 + 1_000 }))).toEqual(['! 도우미가 승인 요청을 띄웠어요 · 1초 전', '명령 실행 — npm install · 승인했다면 실행 중이에요'])
+  // Once it is stale and the main turn has ended, the helpers' row keeps a note of it.
+  const ended = { ...WORKING, phase: 'done' as const, durationMs: 5_000 }
+  expect(texts(statusRows({ ...STATUS, isWorking: false, work: ended, helpers: 1, helperAsks: [helperAsk], now: T0 + ASK_FRESH_MS })))
+    .toEqual(['✓ 끝났어요 · 5초 걸림 · 다음 지시를 기다려요', '● 백그라운드 도우미 1명은 아직 일하는 중 · 승인 요청이 떴었어요'])
+})
+
+test('the status rows once the turn has ended', async () => {
+  const ended = (over: Partial<Work>) => texts(statusRows({ ...STATUS, isWorking: false, work: { ...WORKING, durationMs: 125_000, tools: 12, ...over } }))
+  expect(ended({ phase: 'done' })).toEqual(['✓ 끝났어요 · 2분 5초 걸림 · 도구 12회 · 다음 지시를 기다려요'])
+  expect(ended({ phase: 'aborted', durationMs: 63_000, tools: 0 })).toEqual(['■ 중단했어요 · 1분 3초 동안 작업함'])
+  expect(ended({ phase: 'error', stopReason: 'error' })).toEqual(['✕ 오류로 멈췄어요 · 대화에 뜬 안내를 확인해 주세요'])
+  expect(ended({ phase: 'error', stopReason: 'refusal' })).toEqual(['✕ 요청을 거절했어요 · 다르게 말해 보세요'])
+  expect(texts(statusRows({ ...STATUS, isWorking: false, beat: false, helpers: 2, work: { ...WORKING, phase: 'done', durationMs: 5_000 } })))
+    .toEqual(['✓ 끝났어요 · 5초 걸림 · 다음 지시를 기다려요', '○ 백그라운드 도우미 2명은 아직 일하는 중'])
+})
+
+test('a teammate in a pane of its own is not counted as at work', async () => {
+  expect(isBusyAgent({ id: 'a1', status: 'running' })).toBe(true)
+  expect(isBusyAgent({ id: 'a1', status: 'waiting' })).toBe(true)
+  expect(isBusyAgent({ id: 'a1', status: 'completed' })).toBe(false)
+  expect(isBusyAgent({ id: 'bob@team', teammateId: 'bob@team', status: 'running' })).toBe(false)
+})
+
+// The engine's side of a turn: the clock, the agents, the notification channel, and tool calls
+// that run until the test finishes them.
+const workWorld = (on: TestArgs[1], now = T0) => {
+  const clock = mock.clock(on, { now })
+  const toasts: string[] = []
+  const finishers: Array<() => void> = []
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('agent.list', () => ({ value: [] }))
+  on('ui.notify', () => ({ value: { isSent: false, reason: 'no-surface' } }))
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('classic.PermissionRequest', () => ({}))
+  on('tool.call', () => new Promise(resolve => finishers.push(() => resolve({ result: {} }))))
+  return { clock, toasts, finish: () => finishers.shift()?.() }
+}
+
+type Drawn = { findAll: (query: { type: string }) => Promise<{ text?: string }[]> }
+const statusTexts = async (ui: Drawn) =>
+  (await ui.findAll({ type: 'Text' })).map(t => t.text ?? '').filter(t => /작업 중|기다리|끝났어요|지금|승인|생각하거나/.test(t))
+
+test('the band puts the work status above the meters, on the terminal and the desktop', async ($, on) => {
+  const world = workWorld(on)
+  await $.session.measure(MEASURE)
+
+  // Before the first turn the band is the meters alone.
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
+    expect(await ui.find({ key: 'status' })).toBeUndefined()
+    expect(await ui.find({ key: 'compact' })).toBeDefined()
+    await ui.unmount()
+  }
+
+  await $.turn.start({ text: 'run the tests', turnId: 't1' })
+  const bash = $.tool.call({ tool: 'Bash', command: 'npm test', description: 'Run tests' })
+  await world.clock.advance(5_000)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+    const rows = await statusTexts(ui)
+    expect(rows[0]).toMatch(/^[●○] 작업 중 · 5초 · 도구 1회$/)
+    expect(rows[1]).toBe('지금 (5초째): 명령 실행 — Run tests')
+    expect(await ui.find({ key: 'status' })).toBeDefined()
+    expect(await ui.find({ key: 'usage' })).toBeDefined()
+    expect(await ui.find({ key: 'compact-off' })).toBeDefined()
+    await ui.unmount()
+  }
+
+  // The dot changes every second.
+  const dots: string[] = []
+  for (let i = 0; i < 2; i += 1) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+    dots.push((await statusTexts(ui))[0]!.slice(0, 1))
+    await ui.unmount()
+    await world.clock.advance(1_000)
+  }
+  expect(new Set(dots).size).toBe(2)
+
+  // A permission prompt for it.
+  await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'npm test', description: 'Run tests' } })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+    expect(await statusTexts(ui)).toEqual(['! 승인 요청이 떴어요 · 방금', '명령 실행 — Run tests · 승인했다면 실행 중이에요'])
+    await ui.unmount()
+  }
+  await world.clock.advance(ASK_FRESH_MS)
+  const later = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  expect((await statusTexts(later))[1]).toBe('지금 (37초째, 승인 요청이 떴었어요): 명령 실행 — Run tests')
+  await later.unmount()
+
+  world.finish()
+  await bash
+  await $.turn.complete({ answer: 'done', durationMs: 42_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
+    expect(await statusTexts(ui)).toEqual(['✓ 끝났어요 · 42초 걸림 · 도구 1회 · 다음 지시를 기다려요'])
+    expect(await ui.find({ key: 'compact' })).toBeDefined()
+    await ui.unmount()
+  }
+
+  // A turn of 30 s or more is announced a moment later; with no channel here, as a toast.
+  expect(world.toasts).toEqual([])
+  await world.clock.advance(2_000)
+  expect(world.toasts).toEqual(['작업이 끝났어요 (42초 걸림)'])
+})
+
+test('a short turn is not announced, nor one followed right away by another', async ($, on) => {
+  const world = workWorld(on)
+  await $.turn.start({ text: 'a', turnId: 't1' })
+  await $.turn.complete({ answer: '', durationMs: 5_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  await $.turn.start({ text: 'b', turnId: 't2' })
+  await $.turn.complete({ answer: '', durationMs: 60_000, isAborted: false, turnId: 't2', reason: 'answer' })
+  await $.turn.start({ text: 'c', turnId: 't3' })
+  await world.clock.advance(3_000)
+  expect(world.toasts).toEqual([])
+})
+
+test('a helper asking for permission shows, and the ask goes when the helper stops', async ($, on) => {
+  const world = workWorld(on)
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'go', turnId: 'main' })
+  await $.turn.start({ text: 'sub', turnId: 'sub', agentId: 'agent-1' })
+  await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'npm install' }, agent_id: 'agent-1' })
+  await world.clock.advance(1_000)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  expect(await statusTexts(ui)).toEqual(['! 도우미가 승인 요청을 띄웠어요 · 1초 전', '명령 실행 — npm install · 승인했다면 실행 중이에요'])
+  await ui.unmount()
+
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 'sub', agentId: 'agent-1', reason: 'answer' })
+  const after = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  expect((await statusTexts(after))[0]).toMatch(/^[●○] 작업 중 · 1초$/)
+  await after.unmount()
+})
+
+test('a helper\'s settled call lets go of its own ask only, not another call\'s of the same tool', async ($, on) => {
+  const world = workWorld(on)
+  on('classic.PostToolUse', () => ({}))
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'go', turnId: 'main' })
+  await $.turn.start({ text: 'sub', turnId: 'sub', agentId: 'agent-1' })
+  await $.classic.PermissionRequest({ tool_name: 'Grep', tool_input: { pattern: 'outside' }, agent_id: 'agent-1' })
+  await $.classic.PostToolUse({ tool_name: 'Grep', tool_input: { pattern: 'inside' }, tool_response: {}, tool_use_id: 'g1', agent_id: 'agent-1' })
+  await world.clock.advance(1_000)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  expect((await statusTexts(ui))[1]).toBe('내용 찾기 — outside · 승인했다면 실행 중이에요')
+  await ui.unmount()
+
+  await $.classic.PostToolUse({ tool_name: 'Grep', tool_input: { pattern: 'outside' }, tool_response: {}, tool_use_id: 'g2', agent_id: 'agent-1' })
+  const after = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  expect((await statusTexts(after))[0]).toMatch(/^[●○] 작업 중/)
+  await after.unmount()
+})
+
+test('a helper\'s turn leaves the compact button as the main loop left it', async ($, on) => {
+  workWorld(on)
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'background work', turnId: 'sub', agentId: 'agent-1' })
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+  expect(await ui.find({ key: 'compact' })).toBeDefined()
+  expect((await statusTexts(ui)).length).toBe(0)
+  await ui.unmount()
 })

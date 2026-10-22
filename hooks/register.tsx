@@ -1,12 +1,28 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionMeasureInput, Timer } from 'claude-code'
+import type {
+  AgentInfo,
+  AgentStatus,
+  EngineInterface,
+  Register,
+  SessionMeasureInput,
+  Timer,
+  ToolCallInput,
+  TurnCompleteInput,
+} from 'claude-code'
 
-import type { Usage } from '../types'
+import type { HelperAsk, Phase, RunningTool, Usage, Work } from '../types'
+
+const IDLE_WORK: Work = { phase: 'idle', startedAt: 0, durationMs: 0, tools: 0, running: [], stopReason: '' }
 
 const usage = atom({ plugin: 'usage-mods', key: 'usage' } as const, null)
 const isCompacting = atom({ plugin: 'usage-mods', key: 'isCompacting' } as const, false)
 const isTurnRunning = atom({ plugin: 'usage-mods', key: 'isTurnRunning' } as const, false)
 const clockNow = atom({ plugin: 'usage-mods', key: 'now' } as const, 0)
+const work = atom({ plugin: 'usage-mods', key: 'work' } as const, IDLE_WORK)
+const beat = atom({ plugin: 'usage-mods', key: 'beat' } as const, false)
+const helpers = atom({ plugin: 'usage-mods', key: 'helpers' } as const, [] as string[])
+const helperTurns = atom({ plugin: 'usage-mods', key: 'helperTurns' } as const, [] as string[])
+const helperAsks = atom({ plugin: 'usage-mods', key: 'helperAsks' } as const, [] as HelperAsk[])
 
 const LABELS: Record<string, string> = { five_hour: '5시간', seven_day: '7일', spend_limit: '한도' }
 
@@ -124,6 +140,312 @@ const tick = async ($: EngineInterface) => {
   const now = await $.clock.now()
   await update($, clockNow, () => now)
 }
+
+// --- Work status -------------------------------------------------------------------------------
+// The rows above the meters: whether the main turn is at work, waits on the person, or has ended,
+// and how many helpers (subagents) still work.
+
+/** A permission prompt counts as waiting on the person this long; past it the call may well run. */
+export const ASK_FRESH_MS = 30_000
+/** An ended turn at least this long is announced: a notification, or a toast where none can be sent. */
+export const ANNOUNCE_AFTER_MS = 30_000
+
+type ToolWords = { label: string; needsMe?: boolean; detail?: (pick: (key: string) => string) => string }
+
+const fileName = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path
+const hostOf = (url: string) => url.replace(/^[a-z]+:\/\//i, '').split('/')[0] ?? url
+
+const TOOL_WORDS: Record<string, ToolWords> = {
+  Bash: { label: '명령 실행', detail: pick => pick('description') || pick('command') },
+  PowerShell: { label: '명령 실행', detail: pick => pick('description') || pick('command') },
+  Read: { label: '파일 읽기', detail: pick => fileName(pick('file_path')) },
+  Edit: { label: '파일 고치기', detail: pick => fileName(pick('file_path')) },
+  Write: { label: '파일 쓰기', detail: pick => fileName(pick('file_path')) },
+  NotebookEdit: { label: '노트 파일 고치기', detail: pick => fileName(pick('notebook_path')) },
+  Grep: { label: '내용 찾기', detail: pick => pick('pattern') },
+  Glob: { label: '파일 찾기', detail: pick => pick('pattern') },
+  WebFetch: { label: '웹 페이지 읽기', detail: pick => hostOf(pick('url')) },
+  WebSearch: { label: '웹 검색', detail: pick => pick('query') },
+  Agent: { label: '도우미에게 맡기기', detail: pick => pick('description') },
+  Task: { label: '도우미에게 맡기기', detail: pick => pick('description') },
+  Workflow: { label: '도우미 여러 명 돌리기' },
+  Skill: { label: '스킬 불러오기', detail: pick => pick('skill') },
+  ToolSearch: { label: '도구 찾기' },
+  TodoWrite: { label: '할 일 정리' },
+  AskUserQuestion: { label: '질문에 답해 주세요', needsMe: true },
+  ExitPlanMode: { label: '계획을 확인해 주세요', needsMe: true },
+}
+
+/** Plain words for a tool call: what it does, and what it works on. */
+export const describeTool = (tool: string, input: unknown): Pick<RunningTool, 'label' | 'detail' | 'needsMe'> => {
+  const args = typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {}
+  const pick = (key: string) => {
+    const value = args[key]
+    return typeof value === 'string' ? value : ''
+  }
+  const words = TOOL_WORDS[tool]
+  const label = words?.label ?? `도구 사용: ${/^mcp__.+?__(.+)$/.exec(tool)?.[1] ?? tool}`
+  const detail = (words?.detail?.(pick) ?? '').replace(/\s+/g, ' ').trim().slice(0, 80)
+  return { label, detail, needsMe: words?.needsMe === true }
+}
+
+/** `45초`, `1분 23초`, `1시간 2분`. */
+export const elapsed = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 60) return `${s}초`
+  const m = Math.floor(s / 60)
+  if (m < 60) return s % 60 > 0 ? `${m}분 ${s % 60}초` : `${m}분`
+  return m % 60 > 0 ? `${Math.floor(m / 60)}시간 ${m % 60}분` : `${Math.floor(m / 60)}시간`
+}
+
+export type StatusTone = 'claude' | 'warning' | 'success' | 'error' | 'dim'
+export type StatusRow = { text: string; tone: StatusTone; bold: boolean }
+export type StatusInput = {
+  work: Work
+  isWorking: boolean
+  now: number
+  beat: boolean
+  helpers: number
+  helperAsks: readonly HelperAsk[]
+  isViewingHelper: boolean
+}
+
+const what = (one: { label: string; detail: string }) => (one.detail ? `${one.label} — ${one.detail}` : one.label)
+
+/** The status rows, top first: none before the session's first turn. */
+export const statusRows = (s: StatusInput): StatusRow[] => {
+  const { work: w } = s
+  const dot = s.beat ? '●' : '○'
+  const lead = s.isViewingHelper ? '메인 대화 · ' : ''
+  const isFresh = (at: number) => s.now - at < ASK_FRESH_MS
+  const ago = (at: number) => (s.now - at < 1000 ? '방금' : `${elapsed(s.now - at)} 전`)
+  const helperAsk = s.helperAsks.filter(ask => isFresh(ask.at)).at(-1)
+
+  if (s.isWorking || w.phase === 'working') {
+    if (w.phase !== 'working') {
+      // Loaded mid-turn: the engine says it works; the clock and the dot start with the next turn.
+      return [{ text: `${lead}작업 중…`, tone: 'claude', bold: true }]
+    }
+
+    const needsMe = w.running.find(one => one.needsMe)
+    if (needsMe !== undefined) {
+      return [
+        { text: `${lead}! 나를 기다리는 중 · ${elapsed(s.now - needsMe.startedAt)}째`, tone: 'warning', bold: true },
+        { text: what(needsMe), tone: 'warning', bold: false },
+      ]
+    }
+
+    // The prompt shows until the person answers, and an approved call runs on: the band cannot tell
+    // the two apart, so its words hold for both.
+    const asked = w.running.find(one => one.askedAt !== null && isFresh(one.askedAt))
+    if (asked !== undefined || helperAsk !== undefined) {
+      const [head, at, one] =
+        asked !== undefined
+          ? (['승인 요청이 떴어요', asked.askedAt ?? s.now, asked] as const)
+          : (['도우미가 승인 요청을 띄웠어요', helperAsk!.at, helperAsk!] as const)
+      return [
+        { text: `${lead}! ${head} · ${ago(at)}`, tone: 'warning', bold: true },
+        { text: `${what(one)} · 승인했다면 실행 중이에요`, tone: 'warning', bold: false },
+      ]
+    }
+
+    const head = [
+      `${lead}${dot} 작업 중`,
+      w.startedAt > 0 ? elapsed(s.now - w.startedAt) : '',
+      w.tools > 0 ? `도구 ${w.tools}회` : '',
+      s.helpers > 0 ? `도우미 ${s.helpers}명 일하는 중` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ')
+    const first = w.running[0]
+    let line = '생각하거나 답을 쓰는 중…'
+    if (first !== undefined) {
+      // Notes go before the call's words, which are what a narrow band cuts.
+      const notes = [
+        s.now - first.startedAt >= 3000 ? `${elapsed(s.now - first.startedAt)}째` : '',
+        first.askedAt !== null ? '승인 요청이 떴었어요' : '',
+      ]
+        .filter(Boolean)
+        .join(', ')
+      const more = w.running.length > 1 ? ` 외 ${w.running.length - 1}개` : ''
+      line = `지금${notes ? ` (${notes})` : ''}: ${what(first)}${more}`
+    }
+    return [
+      { text: head, tone: 'claude', bold: true },
+      { text: line, tone: 'dim', bold: false },
+    ]
+  }
+
+  const tools = w.tools > 0 ? ` · 도구 ${w.tools}회` : ''
+  const rows: StatusRow[] = []
+  if (w.phase === 'done') {
+    rows.push({ text: `${lead}✓ 끝났어요 · ${elapsed(w.durationMs)} 걸림${tools} · 다음 지시를 기다려요`, tone: 'success', bold: true })
+  } else if (w.phase === 'aborted') {
+    rows.push({ text: `${lead}■ 중단했어요 · ${elapsed(w.durationMs)} 동안 작업함${tools}`, tone: 'warning', bold: true })
+  } else if (w.phase === 'error') {
+    // A full context, a usage limit or a network error all end here: the transcript says which.
+    const text = w.stopReason === 'refusal' ? '✕ 요청을 거절했어요 · 다르게 말해 보세요' : '✕ 오류로 멈췄어요 · 대화에 뜬 안내를 확인해 주세요'
+    rows.push({ text: `${lead}${text}`, tone: 'error', bold: true })
+  }
+  if (helperAsk !== undefined) {
+    rows.push({ text: `! 도우미가 승인 요청을 띄웠어요 · ${ago(helperAsk.at)} · ${what(helperAsk)}`, tone: 'warning', bold: true })
+  } else if (s.helpers > 0) {
+    const asking = s.helperAsks.length > 0 ? ' · 승인 요청이 떴었어요' : ''
+    rows.push({ text: `${dot} 백그라운드 도우미 ${s.helpers}명은 아직 일하는 중${asking}`, tone: 'claude', bold: false })
+  }
+  return rows
+}
+
+const BUSY: ReadonlySet<AgentStatus> = new Set(['pending', 'running', 'waiting'])
+
+/** At work as the tasks list says; a teammate in a terminal pane of its own keeps its last word there, so it is left out. */
+export const isBusyAgent = (agent: Pick<AgentInfo, 'id' | 'status' | 'teammateId'>): boolean =>
+  BUSY.has(agent.status) && !(agent.teammateId !== undefined && agent.id === agent.teammateId)
+
+const withId = (list: string[], id: string) => (list.includes(id) ? list : [...list, id])
+const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every(id => b.includes(id))
+
+// The status only feeds the band: work that fails must never fail the hook it rides on.
+const quietly = (task: Promise<unknown>) => task.then(() => undefined, () => undefined)
+
+// The module's own, so a reload cancels it with the old environment; session.start starts it again.
+let workTicker: Timer | undefined
+let isWorkTicking = false
+
+const stopWorkTicker = () => {
+  workTicker?.cancel()
+  workTicker = undefined
+}
+
+// Once a second while the main turn or a helper works: moves the clock and the dot, recounts the
+// helpers, and lets go of their stale asks. Stops once nothing works; the next turn starts it again.
+const workTick = async ($: EngineInterface) => {
+  if (isWorkTicking) return
+  isWorkTicking = true
+  try {
+    const [w, known] = await Promise.all([read($, work), read($, helpers)])
+    if (w.phase !== 'working' && known.length === 0) {
+      stopWorkTicker()
+      return
+    }
+    const listed = (await $.agent.list()).filter(isBusyAgent).map(agent => agent.id)
+    const busy = [...new Set([...listed, ...(await read($, helperTurns))])]
+    if (!sameIds(busy, known)) await update($, helpers, () => busy)
+    await update($, helperAsks, list => (list.every(ask => busy.includes(ask.agentId)) ? list : list.filter(ask => busy.includes(ask.agentId))))
+    const at = await $.clock.now()
+    await update($, clockNow, () => at)
+    await update($, beat, on => !on)
+  } catch {
+    // The next tick tries again.
+  } finally {
+    isWorkTicking = false
+  }
+}
+
+const startWorkTicker = ($: EngineInterface) => {
+  workTicker ??= $.clock.every(1000, () => void workTick($))
+}
+
+const startMainTurn = async ($: EngineInterface) => {
+  const at = await $.clock.now()
+  await update($, clockNow, () => at)
+  await update($, work, () => ({ ...IDLE_WORK, phase: 'working', startedAt: at }))
+  startWorkTicker($)
+}
+
+const startHelperTurn = async ($: EngineInterface, agentId: string) => {
+  await update($, helperTurns, list => withId(list, agentId))
+  await update($, helpers, list => withId(list, agentId))
+  startWorkTicker($)
+}
+
+const endHelperTurn = async ($: EngineInterface, agentId: string) => {
+  await update($, helperTurns, list => list.filter(id => id !== agentId))
+  await update($, helpers, list => list.filter(id => id !== agentId))
+  await update($, helperAsks, list => list.filter(ask => ask.agentId !== agentId))
+}
+
+// Waits a moment first: a turn that starts right away (a queued prompt) makes the news stale.
+const announceEnd = async ($: EngineInterface, text: string) => {
+  if ((await read($, work)).phase === 'working') return
+  const waiting = (await read($, helpers)).length
+  const full = waiting > 0 ? `${text} · 도우미 ${waiting}명은 아직 일하는 중` : text
+  // The desktop app has no terminal to notify through (`no-surface`), and a bell shows no words.
+  const sent = await $.ui.notify(full, { title: 'Claude Code' }).catch(() => undefined)
+  if (sent === undefined || !sent.isSent || sent.channel === 'terminal_bell') {
+    $.ui.toast(full, { timeoutMs: 10_000 })
+  }
+}
+
+const endMainTurn = async ($: EngineInterface, e: TurnCompleteInput) => {
+  const phase: Phase = e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? 'aborted' : 'error'
+  const stopReason: Work['stopReason'] = e.reason === 'refusal' ? 'refusal' : e.reason === 'error' ? 'error' : ''
+  await update($, work, w => ({ ...w, phase, durationMs: e.durationMs, running: [], stopReason }))
+  if (phase !== 'aborted' && e.durationMs >= ANNOUNCE_AFTER_MS) {
+    const text = phase === 'done' ? `작업이 끝났어요 (${elapsed(e.durationMs)} 걸림)` : '작업이 멈췄어요'
+    $.clock.after(2000, () => void announceEnd($, text))
+  }
+}
+
+const openCall = async ($: EngineInterface, e: ToolCallInput): Promise<string> => {
+  const startedAt = await $.clock.now()
+  const tool = String(e.tool)
+  const call: RunningTool = {
+    id: e.tool_use_id ?? `${tool}@${startedAt}`,
+    tool,
+    ...describeTool(tool, e),
+    startedAt,
+    askedAt: null,
+  }
+  await update($, work, w => (w.phase === 'working' ? { ...w, tools: w.tools + 1, running: [...w.running, call] } : w))
+  return call.id
+}
+
+const closeCall = async ($: EngineInterface, id: string) => {
+  await update($, work, w => ({ ...w, running: w.running.filter(one => one.id !== id) }))
+}
+
+// A prompt the person must answer: the main loop's call it belongs to, or a helper's ask.
+const markAsked = async ($: EngineInterface, agentId: string | undefined, tool: string, input: unknown) => {
+  const at = await $.clock.now()
+  const { label, detail } = describeTool(tool, input)
+  if (agentId !== undefined) {
+    await update($, helperAsks, list => [...list, { agentId, tool, label, detail, at }].slice(-20))
+    return
+  }
+  await update($, work, w => {
+    const open = w.running.filter(one => one.askedAt === null && one.tool === tool)
+    const target = open.find(one => one.detail === detail) ?? open[0]
+    return target === undefined
+      ? w
+      : { ...w, running: w.running.map(one => (one.id === target.id ? { ...one, askedAt: at } : one)) }
+  })
+}
+
+// The prompt carries no call id, so a settled call lets go of the one ask with its own words: a
+// helper's other call of the same tool may still be asking.
+const dropHelperAsk = async ($: EngineInterface, agentId: string, tool: string, input: unknown) => {
+  const { detail } = describeTool(tool, input)
+  await update($, helperAsks, list => {
+    const index = list.findIndex(ask => ask.agentId === agentId && ask.tool === tool && ask.detail === detail)
+    return index === -1 ? list : [...list.slice(0, index), ...list.slice(index + 1)]
+  })
+}
+
+const resetWork = async ($: EngineInterface) => {
+  stopWorkTicker()
+  await update($, work, () => IDLE_WORK)
+  await update($, helpers, () => [])
+  await update($, helperTurns, () => [])
+  await update($, helperAsks, () => [])
+}
+
+// After a reload mid-turn the stored status stands, and its ticker starts again.
+const resumeWork = async ($: EngineInterface) => {
+  const [w, known] = await Promise.all([read($, work), read($, helpers)])
+  if (w.phase === 'working' || known.length > 0) startWorkTicker($)
+}
+// --- end of work status ------------------------------------------------------------------------
 
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
@@ -334,7 +656,60 @@ export const register: Register = on => {
     await update($, usage, () => toUsage(u))
     await tick($)
     $.clock.every(MINUTE, () => void tick($))
+    await quietly(resumeWork($))
     return result
+  })
+
+  // A /clear or a resume starts the conversation over: no turn of it has run yet.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      await quietly(resetWork($))
+    }
+    return next(e)
+  })
+
+  // What the main loop runs now, for the status rows; a helper's call settling lets go of its ask.
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId !== undefined) {
+      const { agentId } = e
+      try {
+        return await next(e)
+      } finally {
+        await quietly(dropHelperAsk($, agentId, String(e.tool), e))
+      }
+    }
+    const id = await openCall($, e).catch(() => undefined)
+    try {
+      return await next(e)
+    } finally {
+      if (id !== undefined) {
+        await quietly(closeCall($, id))
+      }
+    }
+  })
+
+  // Raised before the permission prompt shows. A hook beneath may decide it, and then nobody is asked.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const result = await next(e)
+    if (result.decision === undefined) {
+      await quietly(markAsked($, e.agent_id, e.tool_name, e.tool_input))
+    }
+    return result
+  })
+
+  // A helper's call has run (or failed): its prompt, if it had one, was answered.
+  on('classic.PostToolUse', async ($, e, next) => {
+    if (e.agent_id !== undefined) {
+      await quietly(dropHelperAsk($, e.agent_id, e.tool_name, e.tool_input))
+    }
+    return next(e)
+  })
+
+  on('classic.PostToolUseFailure', async ($, e, next) => {
+    if (e.agent_id !== undefined) {
+      await quietly(dropHelperAsk($, e.agent_id, e.tool_name, e.tool_input))
+    }
+    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
@@ -344,10 +719,14 @@ export const register: Register = on => {
 
   // The plugin's own record of a running turn, beside the band's isWorking: the button is off while either says so.
   on('turn.start', async ($, e, next) => {
-    await update($, isTurnRunning, () => true)
+    // A helper's turn is not the main one: turn.complete clears this for the main loop alone.
+    if (e.agentId === undefined) {
+      await update($, isTurnRunning, () => true)
+    }
     if (waiting !== null) {
       trace($, `turn started while /compact waits: ${describePrompt(e.text)}`)
     }
+    await quietly(e.agentId === undefined ? startMainTurn($) : startHelperTurn($, e.agentId))
     return next(e)
   })
 
@@ -358,6 +737,9 @@ export const register: Register = on => {
       if (waiting !== null) {
         trace($, `turn ended (${e.reason}) while /compact waits`)
       }
+      await quietly(endMainTurn($, e))
+    } else {
+      await quietly(endHelperTurn($, e.agentId))
     }
     return result
   })
@@ -400,22 +782,59 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const u = await read($, usage)
-    if (e.props.hasSurvey || u === null) {
+    if (e.props.hasSurvey) {
+      return next(e)
+    }
+    const [u, w, helperIds, asks, pulse] = await Promise.all([
+      read($, usage),
+      read($, work),
+      read($, helpers),
+      read($, helperAsks),
+      read($, beat),
+    ])
+    const isBusy = e.props.isWorking || w.phase === 'working' || helperIds.length > 0
+    const hasReset = u !== null && u.limits.some(l => l.resetsAt !== undefined)
+    // A turn's start sets the clock, so only the countdown ever needs to ask for the time.
+    const stored = hasReset || isBusy ? await read($, clockNow) : 0
+    const now = stored || (hasReset ? await $.clock.now() : 0)
+    const status = statusRows({
+      work: w,
+      isWorking: e.props.isWorking,
+      now,
+      beat: pulse,
+      helpers: helperIds.length,
+      helperAsks: asks,
+      isViewingHelper: e.props.view.agentId !== undefined,
+    })
+    if (u === null && status.length === 0) {
       return next(e)
     }
     lastIsWorking = e.props.isWorking // compaction trace
 
+    const table = $.ui.resolve(e)
+    const { Box, Button, Text } = table
+
+    // The work status sits above the meters, one row a line, each cut at the band's edge.
+    const statusBox =
+      status.length === 0 ? null : (
+        <Box key="status" flexDirection="column">
+          {status.map(row => (
+            <Text {...(row.tone === 'dim' ? { dimColor: true } : { color: row.tone })} bold={row.bold} wrap="truncate-end">
+              {row.text}
+            </Text>
+          ))}
+        </Box>
+      )
+    if (u === null) {
+      return <Box flexDirection="column">{statusBox}</Box>
+    }
+
     const rows = meters(u)
-    const hasReset = u.limits.some(l => l.resetsAt !== undefined)
-    const now = hasReset ? (await read($, clockNow)) || (await $.clock.now()) : 0
     const reset = weeklyReset(u, now)
     const cost = costText(u)
     const compacting = await read($, isCompacting)
     const turnRunning = await read($, isTurnRunning)
     const isEnabled = canCompact(u, e.props.isWorking || turnRunning, compacting)
-    const table = $.ui.resolve(e)
-    const { Box, Button, Text } = table
     // The terminal draws the bar in block glyphs; elsewhere they show seams and a dotted track.
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
 
@@ -458,8 +877,8 @@ export const register: Register = on => {
     // meters() always leads with the context meter.
     const [context, ...limits] = rows as [Meter, ...Meter[]]
 
-    return (
-      <Box flexDirection="row">
+    const meterRow = (
+      <Box key="usage" flexDirection="row">
         {meter(context)}
         <Box key="compact-slot" marginRight={2}>
           {isEnabled ? (
@@ -480,6 +899,15 @@ export const register: Register = on => {
             <Text dimColor>{cost}</Text>
           </Box>
         )}
+      </Box>
+    )
+
+    return statusBox === null ? (
+      meterRow
+    ) : (
+      <Box flexDirection="column">
+        {statusBox}
+        {meterRow}
       </Box>
     )
   })

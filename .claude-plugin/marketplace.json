@@ -1,6 +1,6 @@
 {
   "name": "usage-mods",
-  "description": "Claude Code usage band: context and rate-limit progress bars with a compact button",
+  "description": "Claude Code usage band: a work-status line, context and rate-limit progress bars with a compact button",
   "owner": {
     "name": "akixi-maison"
   },
