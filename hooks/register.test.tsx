@@ -694,6 +694,10 @@ test('a stop\'s snapshot drops what ended unannounced and adds what the band did
   expect(after.find(t => t.id === 'm9')?.detail).toBe('Watch deploy')
   expect(after.find(t => t.id === 'w9')?.detail).toBe('code-review')
   expect(reconcileTasks(tracked, [], at + SNAPSHOT_GRACE_MS).map(t => t.id)).toEqual([])
+  // A command-run monitor comes as a 'shell': the kind the mod saw it start with says what it is.
+  const watched = reconcileTasks([], [{ id: 'm5', type: 'shell', status: 'running', description: 'Watch the log', command: 'tail -f app.log' }], at, new Map([['m5', 'monitor' as const]]))
+  expect(watched).toEqual([{ id: 'm5', kind: 'monitor', label: '지켜보기', detail: 'Watch the log', startedAt: 0, endsBy: 0, seenAt: at }])
+  expect(reconcileTasks([], [{ id: 'a9', type: 'subagent', status: 'running', description: '' }], at, new Map([['a9', 'monitor' as const]]))).toEqual([])
 })
 
 test('the background rows: one task with its time, several by kind, helpers keeping their dot', async () => {
@@ -1321,4 +1325,16 @@ test('a schedule weeks away still turns to 곧 실행 on time: the clock wakes w
   expect(await bandText($)).toContain('◷ 64일 0시간 후 실행 · christmas morning')
   await world.clock.advance(far - T0 - 30_000)
   expect(await bandText($)).toContain('◷ 곧 실행 · christmas morning')
+})
+
+test('a helper\'s monitor shows as one from the stop\'s snapshot, though the snapshot calls it a shell', async ($, on) => {
+  const world = workWorld(on, { answer: e => (e.tool === 'Monitor' ? { taskId: 'm5', timeoutMs: 300_000 } : {}) })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Monitor', description: 'Watch the log', timeout_ms: 300_000, command: 'tail -f app.log', agentId: 'agent-1' } as never)
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(await bandText($)).not.toContain('◌ 백그라운드')
+  await world.clock.advance(SNAPSHOT_GRACE_MS)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'm5', type: 'shell', status: 'running', description: 'Watch the log', command: 'tail -f app.log' }] })
+  expect(await bandText($)).toContain('◌ 백그라운드: 지켜보기 — Watch the log')
 })

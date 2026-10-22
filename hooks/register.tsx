@@ -302,13 +302,21 @@ const SNAPSHOT_KINDS: Record<string, BackgroundKind> = { shell: 'shell', monitor
  * The tracked tasks as a stop's snapshot leaves them: those it no longer lists are dropped (unless
  * recorded too recently for it), and the commands, monitors and workflows it lists that the mod did
  * not see start (a helper's, one from before a /clear) are added without a start time.
+ *
+ * The snapshot reports a command-run monitor as a 'shell': `kinds`, the kinds of ids the mod saw
+ * started (a helper's included), says which it is.
  */
-export const reconcileTasks = (tracked: readonly BackgroundTask[], snapshot: readonly TaskSnapshot[], at: number): BackgroundTask[] => {
+export const reconcileTasks = (
+  tracked: readonly BackgroundTask[],
+  snapshot: readonly TaskSnapshot[],
+  at: number,
+  kinds: ReadonlyMap<string, BackgroundKind> = new Map(),
+): BackgroundTask[] => {
   const listed = new Set(snapshot.map(one => one.id))
   const kept = tracked.filter(task => listed.has(task.id) || at - task.seenAt < SNAPSHOT_GRACE_MS)
   const known = new Set(kept.map(task => task.id))
   const added = snapshot.flatMap((one): BackgroundTask[] => {
-    const kind = SNAPSHOT_KINDS[one.type]
+    const kind = SNAPSHOT_KINDS[one.type] === undefined ? undefined : kinds.get(one.id) ?? SNAPSHOT_KINDS[one.type]
     if (kind === undefined || known.has(one.id)) return []
     const detail = clip(kind === 'workflow' ? one.name || one.description : one.description || one.command || '')
     return [{ id: one.id, kind, label: KIND_LABELS[kind], detail, startedAt: 0, endsBy: 0, seenAt: at }]
@@ -752,6 +760,20 @@ const noteSchedule = async ($: EngineInterface, tool: string, input: unknown, re
   return true
 }
 
+// The kinds of background tasks the mod saw start, whichever loop started them, for reading a
+// stop's snapshot; the module's own, so a reload forgets them and a monitor reads as a command.
+const taskKinds = new Map<string, BackgroundKind>()
+const TASK_KINDS_KEPT = 100
+
+const rememberKind = (task: BackgroundTask) => {
+  taskKinds.delete(task.id)
+  taskKinds.set(task.id, task.kind)
+  for (const id of taskKinds.keys()) {
+    if (taskKinds.size <= TASK_KINDS_KEPT) break
+    taskKinds.delete(id)
+  }
+}
+
 // A settled call may have left work in the background, stopped some, or stored a schedule: its record says which.
 const noteCall = async ($: EngineInterface, e: ToolCallInput, result: ToolCallResult, startedAt: number | undefined) => {
   if (result.deny !== undefined || result.isError === true) return
@@ -761,10 +783,11 @@ const noteCall = async ($: EngineInterface, e: ToolCallInput, result: ToolCallRe
   if (await noteSchedule($, tool, e, result.result, now)) return
   const stopped = stoppedTaskId(tool, result.result)
   if (stopped !== null) return dropTasks($, [stopped])
-  // A helper's background work is the helper's: its notification goes to the helper, so it shows from a stop's snapshot.
-  if (e.agentId !== undefined) return
   const task = taskFromCall(tool, e, result.result, startedAt ?? now, now)
-  if (task !== null) await update($, tasks, list => [...list.filter(one => one.id !== task.id), task].slice(-MAX_TASKS))
+  if (task === null) return
+  rememberKind(task)
+  // A helper's background work is the helper's: its notification goes to the helper, so it shows from a stop's snapshot.
+  if (e.agentId === undefined) await update($, tasks, list => [...list.filter(one => one.id !== task.id), task].slice(-MAX_TASKS))
 }
 
 // A stored prompt fired: its schedule has run.
@@ -777,7 +800,7 @@ const fireStored = async ($: EngineInterface, text: string) => {
 // what ended, expired or was made unseen. A field the engine left out changes nothing.
 const applySnapshot = async ($: EngineInterface, snapshot: readonly TaskSnapshot[] | undefined, crons: readonly CronSnapshot[] | undefined) => {
   const at = await $.clock.now()
-  if (snapshot !== undefined) await update($, tasks, list => reconcileTasks(list, snapshot, at))
+  if (snapshot !== undefined) await update($, tasks, list => reconcileTasks(list, snapshot, at, taskKinds))
   if (crons !== undefined) await changeSchedules($, list => reconcileSchedules(list, crons, at))
 }
 
@@ -1102,13 +1125,13 @@ export const register: Register = on => {
   })
 
   // Each time the main loop stops it lists the session's background work still in flight: what
-  // ended without a notification the band saw drops out here. Its result passes on untouched.
+  // ended without a notification the band saw drops out here. The list is taken before the stop
+  // hooks run, so it is read as of now, before they take their time; their result passes on untouched.
   on('classic.Stop', async ($, e, next) => {
-    const result = await next(e)
     if (e.agent_id === undefined) {
       await quietly(applySnapshot($, e.background_tasks, e.session_crons))
     }
-    return result
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('session.measure', async ($, e, next) => {
