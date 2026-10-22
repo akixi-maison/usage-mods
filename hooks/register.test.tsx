@@ -759,14 +759,17 @@ test('a settled call\'s record tells which schedule it stored, deleted or ended'
   expect(scheduleFromCall('CronCreate', { cron: '0 9 * * *', prompt: 'p' }, { id: 'c2', humanSchedule: '', recurring: false }, T0)?.nextAt).toBe(0)
   expect(scheduleFromCall('ScheduleWakeup', { delaySeconds: 240, reason: 'watching the build', prompt: '<<autonomous-loop-dynamic>>' }, { scheduledFor: T0 + 4 * MIN, clampedDelaySeconds: 240, wasClamped: false }, T0))
     .toEqual({ id: `wakeup@${T0 + 4 * MIN}`, kind: 'wakeup', recurring: false, nextAt: T0 + 4 * MIN, detail: 'watching the build', prompt: '<<autonomous-loop-dynamic>>', seenAt: T0 })
-  expect(scheduleFromCall('ScheduleWakeup', { prompt: '<<autonomous-loop-dynamic>>' }, { scheduledFor: T0 + MIN }, T0)?.detail).toBe('반복 작업')
+  expect(scheduleFromCall('ScheduleWakeup', { prompt: '<<autonomous-loop-dynamic>>' }, { scheduledFor: T0 + MIN }, T0)?.detail).toBe('/loop')
   expect(scheduleFromCall('ScheduleWakeup', { stop: true }, { scheduledFor: 0, stopped: true, cancelledWakeups: 1 }, T0)).toBeNull()
   expect(scheduleFromCall('Bash', {}, { id: 'x' }, T0)).toBeNull()
   expect(deletedScheduleId('CronDelete', { id: 'c1' })).toBe('c1')
   expect(deletedScheduleId('CronCreate', { id: 'c1' })).toBeNull()
   expect(stopsWakeups('ScheduleWakeup', { stopped: true })).toBe(true)
   expect(stopsWakeups('ScheduleWakeup', { scheduledFor: T0 })).toBe(false)
-  expect(promptWords('<<autonomous-loop>>')).toBe('반복 작업')
+  expect(promptWords('<<autonomous-loop>>')).toBe('/loop')
+  expect(promptWords('<<loop.md>>')).toBe('/loop')
+  expect(describeTool('CronCreate', { cron: '*/10 * * * *', prompt: '<<autonomous-loop>>' }).detail).toBe('/loop')
+  expect(describeTool('ScheduleWakeup', { delaySeconds: 60, prompt: '<<autonomous-loop-dynamic>>' }).detail).toBe('/loop')
   expect(promptWords('  /loop 5m   check ... [+20 chars]')).toBe('/loop 5m check')
 })
 
@@ -779,6 +782,9 @@ test('a fired prompt ends its one-shot schedule and leaves a recurring one with 
   // Nothing due and nothing matching: nothing goes; a recurring one is never taken by time alone.
   expect(fireSchedule(list, 'something else', T0)).toEqual(list)
   expect(fireSchedule([list[1]!], 'something else', T0 + 60 * MIN)).toEqual([list[1]])
+  // A /loop's job stores a sentinel and fires as the loop's own text: the one due within the minute ran.
+  const loop = plan({ id: 'l1', recurring: true, prompt: '<<autonomous-loop>>', detail: '/loop', nextAt: T0 + 30_000 })
+  expect(fireSchedule([loop], 'check the build and report', T0)).toEqual([{ ...loop, nextAt: 0 }])
 })
 
 test('a stop\'s snapshot keeps the listed schedules, names a wakeup, and drops or adds the rest', async () => {
@@ -795,6 +801,12 @@ test('a stop\'s snapshot keeps the listed schedules, names a wakeup, and drops o
   // The wakeup keeps its time and words under the job's id.
   expect(after[1]).toEqual({ ...wakeup, id: 'w7' })
   expect(after[3]).toEqual({ id: 'c9', kind: 'cron', recurring: true, nextAt: 0, detail: 'hourly report', prompt: 'hourly report', seenAt: at })
+  // A recurring job whose run the band missed loses its past time; a one-shot still due keeps it.
+  const missed = reconcileSchedules([plan({ recurring: true, nextAt: at - MIN }), plan({ id: 'c2', nextAt: at - MIN })], [
+    { id: 'c1', schedule: '* * * * *', recurring: true, prompt: 'check the deploy' },
+    { id: 'c2', schedule: '1 2 3 4 *', recurring: false, prompt: 'check the deploy' },
+  ], at)
+  expect(missed.map(one => one.nextAt)).toEqual([0, at - MIN])
 })
 
 test('the schedule rows: one with its time and words, several with the next run', async () => {
@@ -811,6 +823,9 @@ test('the schedule rows: one with its time and words, several with the next run'
   expect(scheduleRow([plan(), plan({ id: 'c2', nextAt: T0 + 9 * MIN })], T0)?.text).toBe('◷ 예약 2개 · 다음은 4분 후')
   expect(scheduleRow([plan({ nextAt: 0 }), plan({ id: 'c2', nextAt: 0 })], T0)?.text).toBe('◷ 예약 2개')
   expect(scheduleRow([], T0)).toBeNull()
+  // A recurring one long past its time ran unseen: no time; a one-shot past its time is about to run.
+  expect(scheduleRow([plan({ recurring: true, nextAt: T0 - 2 * MIN })], T0)?.text).toBe('◷ 반복 예약 · check the deploy')
+  expect(scheduleRow([plan({ nextAt: T0 - 2 * MIN })], T0)?.text).toBe('◷ 곧 실행 · check the deploy')
   // Beside a turn at work, schedules join the background row, or stand alone.
   expect(backgroundNote([task()], [plan()], T0)?.text).toBe('◌ 백그라운드: 명령 1개 · 예약 1개 (4분 후)')
   expect(backgroundNote([], [plan()], T0)?.text).toBe('◷ 4분 후 실행 · check the deploy')
@@ -1305,4 +1320,17 @@ test('a dropped notification leaves the next turn as the person\'s', async ($, o
   const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
   expect((await statusTexts(ui))[0]).toMatch(/^[●○] 작업 중 · 0초$/)
   await ui.unmount()
+})
+
+test('a schedule weeks away still turns to 곧 실행 on time: the clock wakes within the hour and looks again', { timeoutMs: 60_000 }, async ($, on) => {
+  const far = T0 + 64 * 24 * 60 * MIN
+  const world = workWorld(on, { answer: e => (e.tool === 'CronCreate' ? { id: 'xmas', humanSchedule: '', recurring: false, nextFireAt: far } : {}) })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'remind me at christmas', turnId: 't1' })
+  await $.tool.call({ tool: 'CronCreate', cron: '0 9 25 12 *', prompt: 'christmas morning', recurring: false })
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  await world.clock.advance(2_000)
+  expect(await bandText($)).toContain('◷ 64일 0시간 후 실행 · christmas morning')
+  await world.clock.advance(far - T0 - 30_000)
+  expect(await bandText($)).toContain('◷ 곧 실행 · christmas morning')
 })

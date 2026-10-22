@@ -177,10 +177,10 @@ const TOOL_WORDS: Record<string, ToolWords> = {
   Workflow: { label: '도우미 여러 명 돌리기' },
   Monitor: { label: '지켜보기 시작', detail: pick => pick('description') },
   TaskStop: { label: '백그라운드 작업 멈추기', detail: pick => pick('task_id') || pick('shell_id') },
-  CronCreate: { label: '예약 만들기', detail: pick => pick('prompt') },
+  CronCreate: { label: '예약 만들기', detail: pick => promptWords(pick('prompt')) },
   CronDelete: { label: '예약 지우기', detail: pick => pick('id') },
   CronList: { label: '예약 확인' },
-  ScheduleWakeup: { label: '다음 실행 예약', detail: pick => pick('reason') },
+  ScheduleWakeup: { label: '다음 실행 예약', detail: pick => pick('reason') || promptWords(pick('prompt')) },
   Skill: { label: '스킬 불러오기', detail: pick => pick('skill') },
   ToolSearch: { label: '도구 찾기' },
   TodoWrite: { label: '할 일 정리' },
@@ -339,11 +339,13 @@ const oneTask = (task: BackgroundTask, now: number) => {
 
 // --- Schedules ---
 
-/** The /loop sentinels a wakeup stores in place of a prompt. */
-const LOOP_SENTINEL = /^<<autonomous-loop(-dynamic)?>>$/
+/** The sentinels /loop stores in place of a prompt; the prompt that fires is the loop's own text. */
+const LOOP_SENTINEL = /^<<(autonomous-loop(-dynamic)?|loop\.md)>>$/
 
-/** A stored prompt in a few words; a /loop's sentinel reads as a repeating task. */
-export const promptWords = (prompt: string): string => (LOOP_SENTINEL.test(prompt.trim()) ? '반복 작업' : clip(prompt))
+const isLoop = (prompt: string) => LOOP_SENTINEL.test(prompt.trim())
+
+/** A stored prompt in a few words; a /loop's sentinel reads as the command. */
+export const promptWords = (prompt: string): string => (isLoop(prompt) ? '/loop' : clip(prompt))
 
 /** The cron job or wakeup a settled call stored; null for any other call, and for a wakeup's stop. */
 export const scheduleFromCall = (tool: string, input: unknown, record: unknown, now: number): Schedule | null => {
@@ -373,12 +375,15 @@ export const deletedScheduleId = (tool: string, record: unknown): string | null 
 export const stopsWakeups = (tool: string, record: unknown): boolean => tool === 'ScheduleWakeup' && asRecord(record)['stopped'] === true
 
 /**
- * The schedules once a stored prompt fired: the one with that prompt, else the earliest one-shot
- * due within the minute. A one-shot goes; a recurring one stays, its next run unknown.
+ * The schedules once a stored prompt fired: the one with that prompt, else the earliest one due
+ * within the minute that could have fired with other words (a one-shot, or a /loop, whose stored
+ * sentinel fires as the loop's text). A one-shot goes; a recurring one stays, its next run unknown.
  */
 export const fireSchedule = (list: readonly Schedule[], text: string, now: number): Schedule[] => {
   const head = clip(text)
-  const due = list.filter(one => !one.recurring && one.nextAt > 0 && one.nextAt <= now + MINUTE).sort((a, b) => a.nextAt - b.nextAt)
+  const due = list
+    .filter(one => (!one.recurring || isLoop(one.prompt)) && one.nextAt > 0 && one.nextAt <= now + MINUTE)
+    .sort((a, b) => a.nextAt - b.nextAt)
   const fired = list.find(one => one.prompt !== '' && one.prompt === head) ?? due[0]
   if (fired === undefined) return [...list]
   return fired.recurring ? list.map(one => (one === fired ? { ...one, nextAt: 0 } : one)) : list.filter(one => one !== fired)
@@ -397,7 +402,8 @@ export const reconcileSchedules = (tracked: readonly Schedule[], snapshot: reado
   const claimed = new Set(tracked.map(one => one.id).filter(id => listed.has(id)))
   const kept = tracked.flatMap((one): Schedule[] => {
     const job = listed.get(one.id)
-    if (job !== undefined) return [{ ...one, recurring: job.recurring }]
+    // A recurring job whose run the band did not see has a next run it cannot tell.
+    if (job !== undefined) return [{ ...one, recurring: job.recurring, nextAt: job.recurring && one.nextAt > 0 && one.nextAt <= at ? 0 : one.nextAt }]
     if (one.kind === 'wakeup' && one.id.startsWith('wakeup@')) {
       const twin = snapshot.find(job => !job.recurring && !claimed.has(job.id) && clip(job.prompt) === one.prompt)
       if (twin !== undefined) {
@@ -424,9 +430,12 @@ export const reconcileSchedules = (tracked: readonly Schedule[], snapshot: reado
 /** `4분 후`, `1시간 2분 후`; `곧` within the minute or past due; '' when not known. */
 export const timeTo = (at: number, now: number): string => (at <= 0 ? '' : at - now < MINUTE ? '곧' : `${timeLeftMs(at - now)} 후`)
 
+/** A schedule's next run as far as the band can tell: a recurring one a minute past its time has run unseen. */
+const nextAtOf = (one: Schedule, now: number) => (one.recurring && one.nextAt > 0 && one.nextAt < now - MINUTE ? 0 : one.nextAt)
+
 const nextRun = (list: readonly Schedule[], now: number) => {
-  const known = list.filter(one => one.nextAt > 0).sort((a, b) => a.nextAt - b.nextAt)[0]
-  return known === undefined ? '' : timeTo(known.nextAt, now)
+  const known = list.map(one => nextAtOf(one, now)).filter(at => at > 0).sort((a, b) => a - b)[0]
+  return known === undefined ? '' : timeTo(known, now)
 }
 
 /** `◷ 4분 후 실행 · 배포 상태 확인`, `◷ 예약 3개 · 다음은 곧 실행`; null with none. */
@@ -434,7 +443,7 @@ export const scheduleRow = (list: readonly Schedule[], now: number): StatusRow |
   if (list.length === 0) return null
   if (list.length === 1) {
     const one = list[0]!
-    const when = timeTo(one.nextAt, now)
+    const when = timeTo(nextAtOf(one, now), now)
     const head = when !== '' ? `${when} 실행` : one.recurring ? '반복 예약' : '예약'
     return { text: `◷ ${head}${one.detail ? ` · ${one.detail}` : ''}`, tone: 'dim', bold: false }
   }
@@ -705,13 +714,19 @@ const dropTasks = async ($: EngineInterface, ids: readonly string[]) => {
 let scheduleTimer: Timer | undefined
 
 // Redraws the moment the nearest schedule turns `곧`, which the minute clock may miss by most of a minute.
+// A wait past about 24.9 days does not fit the host's timer, which fires it at once: it wakes within
+// the hour at most and looks again.
 const armScheduleClock = async ($: EngineInterface) => {
   scheduleTimer?.cancel()
   scheduleTimer = undefined
   const [list, now] = await Promise.all([read($, schedules), $.clock.now()])
+  // Another call may have armed one meanwhile.
+  scheduleTimer?.cancel()
+  scheduleTimer = undefined
   const turns = list.map(one => one.nextAt - MINUTE).filter(at => at >= now)
   if (turns.length > 0) {
-    scheduleTimer = $.clock.after(Math.min(...turns) - now + 1, () => void tick($).then(() => armScheduleClock($)))
+    const wait = Math.min(Math.min(...turns) - now + 1, HOUR)
+    scheduleTimer = $.clock.after(wait, () => void tick($).then(() => armScheduleClock($)))
   }
 }
 
