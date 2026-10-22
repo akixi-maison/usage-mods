@@ -2,10 +2,13 @@ import type { AgentInfo } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import type { Work } from '../types'
+import type { BackgroundTask, Work } from '../types'
 import {
   appendLine,
   ASK_FRESH_MS,
+  backgroundNote,
+  backgroundParts,
+  backgroundRow,
   bar,
   BAR_PX,
   barSvg,
@@ -14,6 +17,7 @@ import {
   describePrompt,
   describeTool,
   elapsed,
+  endedTaskIds,
   hasCompacted,
   hoverParts,
   hoverText,
@@ -24,8 +28,13 @@ import {
   meters,
   OFF_HINT,
   QUEUE_TIMEOUT,
+  reconcileTasks,
+  runningFor,
   shouldSendCompact,
+  SNAPSHOT_GRACE_MS,
   statusRows,
+  stoppedTaskId,
+  taskFromCall,
   weeklyReset,
 } from './register'
 
@@ -612,6 +621,116 @@ test('the status rows once the turn has ended', async () => {
     .toEqual(['✓ 끝났어요 · 5초 걸림 · 다음 지시를 기다려요', '○ 백그라운드 도우미 2명은 아직 일하는 중'])
 })
 
+// --- Background work ------------------------------------------------------------------------------
+
+const MIN = 60_000
+const task = (over: Partial<BackgroundTask> = {}): BackgroundTask => ({
+  id: 'b1', kind: 'shell', label: '명령 실행', detail: 'Run dev server', startedAt: T0, endsBy: 0, seenAt: T0, ...over,
+})
+
+test('the background tools in plain words', async () => {
+  expect(describeTool('Bash', { command: 'npm run dev', description: 'Run dev server', run_in_background: true }).label).toBe('백그라운드로 명령 실행')
+  expect(describeTool('Bash', { command: 'npm test', run_in_background: false }).label).toBe('명령 실행')
+  expect(describeTool('Monitor', { description: 'Watch CI until green', timeout_ms: 300_000 })).toEqual({ label: '지켜보기 시작', detail: 'Watch CI until green', needsMe: false })
+  expect(describeTool('TaskStop', { task_id: 'b1' })).toEqual({ label: '백그라운드 작업 멈추기', detail: 'b1', needsMe: false })
+  expect(describeTool('TaskStop', { shell_id: 'b2' }).detail).toBe('b2')
+})
+
+test('a settled call\'s record tells which background task it started', async () => {
+  const bash = { command: 'npm run dev', description: 'Run dev server' }
+  expect(taskFromCall('Bash', bash, { stdout: '', backgroundTaskId: 'b1' }, T0, T0 + 10)).toEqual(task({ seenAt: T0 + 10 }))
+  // Ctrl+B and a timeout move it with the same id; the time runs from the call's start.
+  expect(taskFromCall('Bash', bash, { backgroundTaskId: 'b2', backgroundedByUser: true }, T0, T0 + 20 * MIN)?.startedAt).toBe(T0)
+  expect(taskFromCall('PowerShell', bash, { backgroundTaskId: 'p1' }, T0, T0)?.kind).toBe('shell')
+  expect(taskFromCall('Bash', bash, { stdout: 'ok' }, T0, T0)).toBeNull()
+  // One that ends with its caller's final response is never left running.
+  expect(taskFromCall('Bash', bash, { backgroundTaskId: 'b3', backgroundEndsWithFinalResponse: true }, T0, T0)).toBeNull()
+
+  const monitor = { description: 'Watch CI', timeout_ms: 300_000 }
+  expect(taskFromCall('Monitor', monitor, { taskId: 'm1', timeoutMs: 300_000 }, T0, T0)).toEqual(
+    task({ id: 'm1', kind: 'monitor', label: '지켜보기', detail: 'Watch CI', endsBy: T0 + 300_000 }))
+  expect(taskFromCall('Monitor', monitor, { taskId: 'm2', timeoutMs: 0, persistent: true }, T0, T0)?.endsBy).toBe(0)
+
+  expect(taskFromCall('Workflow', {}, { status: 'async_launched', taskId: 'w1', taskType: 'local_workflow', workflowName: 'code-review' }, T0, T0))
+    .toEqual(task({ id: 'w1', kind: 'workflow', label: '워크플로', detail: 'code-review' }))
+  expect(taskFromCall('Workflow', {}, { status: 'remote_launched', taskId: 'w2' }, T0, T0)?.label).toBe('원격 워크플로')
+  expect(taskFromCall('Read', { file_path: 'a' }, { taskId: 'x' }, T0, T0)).toBeNull()
+  expect(stoppedTaskId('TaskStop', { message: 'stopped', task_id: 'b1', task_type: 'local_bash' })).toBe('b1')
+  expect(stoppedTaskId('Bash', { task_id: 'b1' })).toBeNull()
+})
+
+test('a notification ends the tasks whose status says so', async () => {
+  const note = (id: string, status: string) => `<task-notification>\n<task-id>${id}</task-id>\n<status>${status}</status>\n<summary>…</summary>\n</task-notification>`
+  expect(endedTaskIds(note('b1', 'completed'))).toEqual(['b1'])
+  expect(endedTaskIds(`${note('b1', 'failed')}\n${note('b2', 'killed')}`)).toEqual(['b1', 'b2'])
+  expect(endedTaskIds(note('m1', 'running'))).toEqual([])
+  expect(endedTaskIds('<task-notification><task-id>m1</task-id><event>line</event></task-notification>')).toEqual([])
+  expect(endedTaskIds('the build finished')).toEqual([])
+})
+
+test('a stop\'s snapshot drops what ended unannounced and adds what the band did not see start', async () => {
+  const at = T0 + 10 * MIN
+  const tracked = [task(), task({ id: 'b2' }), task({ id: 'b3', seenAt: at - 500 })]
+  const snapshot = [
+    { id: 'b1', type: 'shell', status: 'running', description: 'Run dev server' },
+    { id: 'b9', type: 'shell', status: 'running', description: '', command: 'npm run watch' },
+    { id: 'm9', type: 'monitor', status: 'running', description: 'Watch deploy ... [+40 chars]' },
+    { id: 'w9', type: 'workflow', status: 'running', description: 'Review', name: 'code-review' },
+    { id: 'a9', type: 'subagent', status: 'running', description: 'helper', agent_type: 'general-purpose' },
+  ]
+  const after = reconcileTasks(tracked, snapshot, at)
+  // b2 is gone; b3 was recorded too recently for the snapshot to list it.
+  expect(after.map(t => t.id)).toEqual(['b1', 'b3', 'b9', 'm9', 'w9'])
+  expect(after.find(t => t.id === 'b9')).toEqual({ id: 'b9', kind: 'shell', label: '명령 실행', detail: 'npm run watch', startedAt: 0, endsBy: 0, seenAt: at })
+  expect(after.find(t => t.id === 'm9')?.detail).toBe('Watch deploy')
+  expect(after.find(t => t.id === 'w9')?.detail).toBe('code-review')
+  expect(reconcileTasks(tracked, [], at + SNAPSHOT_GRACE_MS).map(t => t.id)).toEqual([])
+})
+
+test('the background rows: one task with its time, several by kind, helpers keeping their dot', async () => {
+  expect(runningFor(59_000)).toBe('')
+  expect(runningFor(12 * MIN + 30_000)).toBe('12분째')
+  expect(runningFor(62 * MIN)).toBe('1시간 2분째')
+  expect(backgroundParts(2, [task(), task({ id: 'm1', kind: 'monitor' }), task({ id: 'b2' })])).toEqual(['도우미 2명', '명령 2개', '모니터 1개'])
+
+  const now = T0 + 12 * MIN
+  expect(backgroundRow(0, false, [task()], now, '●')).toEqual({ text: '◌ 백그라운드 (12분째): 명령 실행 — Run dev server', tone: 'dim', bold: false })
+  expect(backgroundRow(0, false, [task({ startedAt: 0 })], now, '●')?.text).toBe('◌ 백그라운드: 명령 실행 — Run dev server')
+  expect(backgroundRow(0, false, [task({ startedAt: now - 30_000 })], now, '●')?.text).toBe('◌ 백그라운드: 명령 실행 — Run dev server')
+  const monitor = task({ id: 'm1', kind: 'monitor', label: '지켜보기', detail: 'Watch CI', endsBy: now - 1 })
+  expect(backgroundRow(0, false, [monitor], now, '●')?.text).toBe('◌ 백그라운드 (곧 끝나요): 지켜보기 — Watch CI')
+  expect(backgroundRow(0, false, [task(), monitor], now, '●')?.text).toBe('◌ 백그라운드에서 아직 일하는 중 · 명령 1개 · 모니터 1개')
+  expect(backgroundRow(2, true, [task()], now, '○')).toEqual({ text: '○ 백그라운드에서 아직 일하는 중 · 도우미 2명 · 명령 1개 · 승인 요청이 떴었어요', tone: 'claude', bold: false })
+  // Helpers alone keep the words they had.
+  expect(backgroundRow(2, false, [], now, '○')?.text).toBe('○ 백그라운드 도우미 2명은 아직 일하는 중')
+  expect(backgroundRow(0, false, [], now, '●')).toBeNull()
+  expect(backgroundNote([task(), task({ id: 'b2' }), monitor], now)?.text).toBe('◌ 백그라운드: 명령 2개 · 모니터 1개')
+  expect(backgroundNote([], now)).toBeNull()
+})
+
+test('the status rows with background work: a dim third row while working, below the end after', async () => {
+  const now = T0 + 3 * MIN
+  const working = texts(statusRows({ ...STATUS, now, tasks: [task()] }))
+  expect(working).toEqual(['● 작업 중 · 3분', '생각하거나 답을 쓰는 중…', '◌ 백그라운드 (3분째): 명령 실행 — Run dev server'])
+  expect(statusRows({ ...STATUS, now, tasks: [task()] })[2]?.tone).toBe('dim')
+  // Waiting on the person keeps to its two rows.
+  const asking = { ...WORKING, running: [call({ id: 'q', tool: 'AskUserQuestion', label: '질문에 답해 주세요', detail: '', needsMe: true })] }
+  expect(statusRows({ ...STATUS, work: asking, now, tasks: [task()] })).toHaveLength(2)
+
+  const ended = { ...WORKING, phase: 'done' as const, durationMs: 5_000 }
+  expect(texts(statusRows({ ...STATUS, isWorking: false, work: ended, now, tasks: [task()] })))
+    .toEqual(['✓ 끝났어요 · 5초 걸림 · 다음 지시를 기다려요', '◌ 백그라운드 (3분째): 명령 실행 — Run dev server'])
+  expect(texts(statusRows({ ...STATUS, isWorking: false, work: ended, now, helpers: 1, tasks: [task(), task({ id: 'b2' })] })))
+    .toEqual(['✓ 끝났어요 · 5초 걸림 · 다음 지시를 기다려요', '● 백그라운드에서 아직 일하는 중 · 도우미 1명 · 명령 2개'])
+  // A helper's fresh ask takes the second row; the background goes dim below it.
+  const helperAsk = { agentId: 'a1', tool: 'Bash', label: '명령 실행', detail: 'npm install', at: now }
+  expect(texts(statusRows({ ...STATUS, isWorking: false, work: ended, now, helpers: 1, helperAsks: [helperAsk], tasks: [task()] })))
+    .toEqual(['✓ 끝났어요 · 5초 걸림 · 다음 지시를 기다려요', '! 도우미가 승인 요청을 띄웠어요 · 방금 · 명령 실행 — npm install', '◌ 백그라운드 (3분째): 명령 실행 — Run dev server'])
+  // Before any turn, after a /clear: the background row alone.
+  expect(texts(statusRows({ ...STATUS, isWorking: false, work: { ...WORKING, phase: 'idle' }, now, tasks: [task({ startedAt: 0 })] })))
+    .toEqual(['◌ 백그라운드: 명령 실행 — Run dev server'])
+})
+
 test('a teammate in a pane of its own is not counted as at work', async () => {
   expect(isBusyAgent({ id: 'a1', status: 'running' })).toBe(true)
   expect(isBusyAgent({ id: 'a1', status: 'waiting' })).toBe(true)
@@ -625,8 +744,10 @@ type WorldOptions = {
   now?: number
   /** What the tasks list says, asked afresh each time. */
   agents?: () => AgentInfo[]
+  /** A tool's record for a call, answered at once; absent, calls run until the test finishes them. */
+  answer?: (e: { tool: string } & Record<string, unknown>) => unknown
 }
-const workWorld = (on: TestArgs[1], { now = T0, agents = () => [] }: WorldOptions = {}) => {
+const workWorld = (on: TestArgs[1], { now = T0, agents = () => [], answer }: WorldOptions = {}) => {
   const clock = mock.clock(on, { now })
   const toasts: string[] = []
   const finishers: Array<() => void> = []
@@ -640,9 +761,21 @@ const workWorld = (on: TestArgs[1], { now = T0, agents = () => [] }: WorldOption
     return { value: undefined }
   })
   on('classic.PermissionRequest', () => ({}))
-  on('tool.call', () => new Promise(resolve => finishers.push(() => resolve({ result: {} }))))
+  on('classic.Stop', () => ({}))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+  on('tool.call', ($, e) =>
+    answer !== undefined
+      ? ({ result: answer(e as never) } as never)
+      : new Promise(resolve => finishers.push(() => resolve({ result: {} }))))
   return { clock, toasts, finish: () => finishers.shift()?.() }
 }
+
+const NOTIFY = (id: string, status: string) => ({
+  text: `<task-notification>\n<task-id>${id}</task-id>\n<status>${status}</status>\n</task-notification>`,
+  origin: { kind: 'task-notification' as const },
+  wait: false,
+})
+const drawnText = async (ui: { drawn: () => Promise<unknown> }) => JSON.stringify(await ui.drawn())
 
 type Drawn = { findAll: (query: { type: string }) => Promise<{ text?: string }[]> }
 const statusTexts = async (ui: Drawn) =>
@@ -790,4 +923,132 @@ test('a helper\'s turn leaves the compact button as the main loop left it', asyn
   expect(await ui.find({ key: 'compact' })).toBeDefined()
   expect((await statusTexts(ui)).length).toBe(0)
   await ui.unmount()
+})
+
+// A session as the band lives in it: the minute clock running, the usage known.
+const startSession = async ($: TestArgs[0], on: TestArgs[1]) => {
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: { startedAt: T0, context: MEASURE.context, rateLimits: MEASURE.rateLimits } }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.session.measure(MEASURE)
+}
+
+const bashRecord = (id: string) => ({ stdout: '', stderr: '', interrupted: false, backgroundTaskId: id })
+
+test('a command left in the background shows past the turn\'s end, and its notification ends it', async ($, on) => {
+  const world = workWorld(on, { answer: e => (e.tool === 'Bash' ? bashRecord('b1') : {}) })
+  await startSession($, on)
+  await $.turn.start({ text: 'start the server', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'npm run dev', description: 'Run dev server', run_in_background: true })
+  const working = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  expect(await statusTexts(working)).toEqual([expect.stringMatching(/^[●○] 작업 중 · 0초 · 도구 1회$/), '생각하거나 답을 쓰는 중…'])
+  expect(await drawnText(working)).toContain('◌ 백그라운드: 명령 실행 — Run dev server')
+  await working.unmount()
+
+  await $.turn.complete({ answer: 'started', durationMs: 5_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: PROPS })
+    expect(await statusTexts(ui)).toEqual(['✓ 끝났어요 · 5초 걸림 · 도구 1회 · 다음 지시를 기다려요'])
+    expect(await drawnText(ui)).toContain('◌ 백그라운드: 명령 실행 — Run dev server')
+    await ui.unmount()
+  }
+
+  // Between turns the minute clock moves its time on.
+  await world.clock.advance(12 * MIN)
+  const later = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
+  expect(await drawnText(later)).toContain('◌ 백그라운드 (12분째): 명령 실행 — Run dev server')
+  await later.unmount()
+
+  await $.prompt.submit(NOTIFY('b1', 'completed'))
+  const done = await $.ui.mount({ plugin: 'usage-mods', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
+  expect(await drawnText(done)).not.toContain('백그라운드')
+  await done.unmount()
+})
+
+test('a running background command names itself as one in the now row', async ($, on) => {
+  const world = workWorld(on)
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'start', turnId: 't1' })
+  const bash = $.tool.call({ tool: 'Bash', command: 'npm run dev', description: 'Run dev server', run_in_background: true })
+  await world.clock.advance(1_000)
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  expect((await statusTexts(ui))[1]).toBe('지금: 백그라운드로 명령 실행 — Run dev server')
+  await ui.unmount()
+  world.finish()
+  await bash
+})
+
+test('TaskStop, a stop\'s snapshot and a /clear each let go of background work', async ($, on) => {
+  const world = workWorld(on, {
+    answer: e =>
+      e.tool === 'Bash'
+        ? bashRecord(String(e['description']))
+        : e.tool === 'TaskStop'
+          ? { message: 'stopped', task_id: String(e['task_id']), task_type: 'local_bash' }
+          : {},
+  })
+  on('session.end', () => ({ sessionId: 's1' }))
+  await startSession($, on)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'a', description: 'one', run_in_background: true })
+  await $.tool.call({ tool: 'Bash', command: 'b', description: 'two', run_in_background: true })
+  await $.tool.call({ tool: 'TaskStop', task_id: 'one' })
+  await $.turn.complete({ answer: '', durationMs: 5_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  const shown = async () => {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: PROPS })
+    const text = await drawnText(ui)
+    await ui.unmount()
+    return text
+  }
+  expect(await shown()).toContain('◌ 백그라운드: 명령 실행 — two')
+  expect(await shown()).not.toContain('— one')
+
+  // A snapshot without the field changes nothing, and a helper's stop is not the main loop's.
+  await world.clock.advance(SNAPSHOT_GRACE_MS)
+  await $.classic.Stop({ stop_hook_active: false })
+  await $.classic.Stop({ stop_hook_active: false, agent_id: 'agent-1', background_tasks: [] })
+  expect(await shown()).toContain('— two')
+  // The main loop's stop lists what is in flight: 'two' ended unannounced, a watcher it never saw start runs.
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'b9', type: 'shell', status: 'running', description: '', command: 'npm run watch' }] })
+  expect(await shown()).toContain('◌ 백그라운드: 명령 실행 — npm run watch')
+  expect(await shown()).not.toContain('— two')
+
+  await $.session.end({ reason: 'clear' })
+  expect(await shown()).not.toContain('백그라운드')
+})
+
+test('a long turn\'s announcement counts the background work still running', async ($, on) => {
+  const world = workWorld(on, { answer: e => (e.tool === 'Bash' ? bashRecord('b1') : {}) })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'npm run dev', description: 'Run dev server', run_in_background: true })
+  await $.turn.complete({ answer: '', durationMs: 42_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  await world.clock.advance(2_000)
+  expect(world.toasts).toEqual(['작업이 끝났어요 (42초 걸림) · 백그라운드에서 아직 일하는 중 (명령 1개)'])
+})
+
+test('a helper\'s background command is left to the snapshot, but its TaskStop still counts', async ($, on) => {
+  workWorld(on, {
+    answer: e =>
+      e.tool === 'TaskStop'
+        ? { message: 'stopped', task_id: String(e['task_id']), task_type: 'local_bash' }
+        : bashRecord(e['agentId'] === undefined ? 'b1' : 'h1'),
+  })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const helperBash = { tool: 'Bash', command: 'npm run watch', description: 'Watch', run_in_background: true, agentId: 'agent-1' }
+  await $.tool.call(helperBash as never)
+  const shown = async () => {
+    const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+    const text = await drawnText(ui)
+    await ui.unmount()
+    return text
+  }
+  expect(await shown()).not.toContain('◌ 백그라운드')
+
+  // The main loop's command shows; the helper stopping it lets it go.
+  await $.tool.call({ tool: 'Bash', command: 'npm run dev', description: 'Run dev server', run_in_background: true })
+  expect(await shown()).toContain('◌ 백그라운드: 명령 실행 — Run dev server')
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1', agentId: 'agent-1' } as never)
+  expect(await shown()).not.toContain('◌ 백그라운드')
 })

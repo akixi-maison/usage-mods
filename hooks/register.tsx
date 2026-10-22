@@ -7,10 +7,11 @@ import type {
   SessionMeasureInput,
   Timer,
   ToolCallInput,
+  ToolCallResult,
   TurnCompleteInput,
 } from 'claude-code'
 
-import type { HelperAsk, Phase, RunningTool, Usage, Work } from '../types'
+import type { BackgroundKind, BackgroundTask, HelperAsk, Phase, RunningTool, Usage, Work } from '../types'
 
 const IDLE_WORK: Work = { phase: 'idle', startedAt: 0, durationMs: 0, tools: 0, running: [], stopReason: '' }
 
@@ -23,6 +24,7 @@ const beat = atom({ plugin: 'usage-mods', key: 'beat' } as const, false)
 const helpers = atom({ plugin: 'usage-mods', key: 'helpers' } as const, [] as string[])
 const helperTurns = atom({ plugin: 'usage-mods', key: 'helperTurns' } as const, [] as string[])
 const helperAsks = atom({ plugin: 'usage-mods', key: 'helperAsks' } as const, [] as HelperAsk[])
+const tasks = atom({ plugin: 'usage-mods', key: 'tasks' } as const, [] as BackgroundTask[])
 
 const LABELS: Record<string, string> = { five_hour: '5시간', seven_day: '7일', spend_limit: '한도' }
 
@@ -169,6 +171,8 @@ const TOOL_WORDS: Record<string, ToolWords> = {
   Agent: { label: '도우미에게 맡기기', detail: pick => pick('description') },
   Task: { label: '도우미에게 맡기기', detail: pick => pick('description') },
   Workflow: { label: '도우미 여러 명 돌리기' },
+  Monitor: { label: '지켜보기 시작', detail: pick => pick('description') },
+  TaskStop: { label: '백그라운드 작업 멈추기', detail: pick => pick('task_id') || pick('shell_id') },
   Skill: { label: '스킬 불러오기', detail: pick => pick('skill') },
   ToolSearch: { label: '도구 찾기' },
   TodoWrite: { label: '할 일 정리' },
@@ -184,7 +188,8 @@ export const describeTool = (tool: string, input: unknown): Pick<RunningTool, 'l
     return typeof value === 'string' ? value : ''
   }
   const words = TOOL_WORDS[tool]
-  const label = words?.label ?? `도구 사용: ${/^mcp__.+?__(.+)$/.exec(tool)?.[1] ?? tool}`
+  const isBackground = (tool === 'Bash' || tool === 'PowerShell') && args['run_in_background'] === true
+  const label = isBackground ? '백그라운드로 명령 실행' : words?.label ?? `도구 사용: ${/^mcp__.+?__(.+)$/.exec(tool)?.[1] ?? tool}`
   const detail = (words?.detail?.(pick) ?? '').replace(/\s+/g, ' ').trim().slice(0, 80)
   return { label, detail, needsMe: words?.needsMe === true }
 }
@@ -208,13 +213,143 @@ export type StatusInput = {
   helpers: number
   helperAsks: readonly HelperAsk[]
   isViewingHelper: boolean
+  /** Background commands, monitors and workflow runs still at work. */
+  tasks?: readonly BackgroundTask[]
 }
 
 const what = (one: { label: string; detail: string }) => (one.detail ? `${one.label} — ${one.detail}` : one.label)
 
+/** Background tasks the band keeps at most; the oldest go first. */
+const MAX_TASKS = 50
+/** A snapshot taken this soon after the mod recorded a task may not list it yet. */
+export const SNAPSHOT_GRACE_MS = 2000
+
+const KIND_WORDS: Record<BackgroundKind, string> = { shell: '명령', monitor: '모니터', workflow: '워크플로' }
+const KIND_LABELS: Record<BackgroundKind, string> = { shell: '명령 실행', monitor: '지켜보기', workflow: '워크플로' }
+
+const asRecord = (value: unknown): Record<string, unknown> =>
+  typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+const str = (value: unknown) => (typeof value === 'string' ? value : '')
+/** One line, cut short, without the engine's `... [+N chars]` clipping mark. */
+const clip = (text: string) => text.replace(/\.\.\. \[\+\d+ chars\]$/, '').replace(/\s+/g, ' ').trim().slice(0, 80)
+
+/** The background task a settled call started, read from the tool's own record; null for any other call. */
+export const taskFromCall = (tool: string, input: unknown, record: unknown, startedAt: number, now: number): BackgroundTask | null => {
+  const r = asRecord(record)
+  const { detail } = describeTool(tool, input)
+  const base = { detail, startedAt, endsBy: 0, seenAt: now }
+  if (tool === 'Bash' || tool === 'PowerShell') {
+    // Run in the background from the start, by Ctrl+B or past its timeout: the record says which, the id is the same.
+    const id = str(r['backgroundTaskId'])
+    // One that ends with its caller's final response sends no notification: it is not left running.
+    return id === '' || r['backgroundEndsWithFinalResponse'] === true ? null : { ...base, id, kind: 'shell', label: KIND_LABELS.shell }
+  }
+  if (tool === 'Monitor') {
+    const id = str(r['taskId'])
+    const timeoutMs = typeof r['timeoutMs'] === 'number' ? r['timeoutMs'] : 0
+    const endsBy = r['persistent'] === true || timeoutMs <= 0 ? 0 : startedAt + timeoutMs
+    return id === '' ? null : { ...base, id, kind: 'monitor', label: KIND_LABELS.monitor, endsBy }
+  }
+  if (tool === 'Workflow') {
+    const id = str(r['taskId'])
+    const isRemote = r['status'] === 'remote_launched' || r['taskType'] === 'remote_agent'
+    const label = isRemote ? '원격 워크플로' : KIND_LABELS.workflow
+    return id === '' ? null : { ...base, id, kind: 'workflow', label, detail: clip(str(r['workflowName'])) }
+  }
+  return null
+}
+
+/** The task a settled TaskStop stopped; null for any other call. */
+export const stoppedTaskId = (tool: string, record: unknown): string | null =>
+  tool === 'TaskStop' ? str(asRecord(record)['task_id']) || null : null
+
+const ENDED = new Set(['completed', 'failed', 'killed', 'stopped', 'cancelled', 'canceled', 'error'])
+
+/**
+ * Ids of the tasks a notification says have ended: each `<task-notification>` block's `<task-id>`
+ * whose `<status>` is an ending one. A monitor's events carry none and end nothing.
+ */
+export const endedTaskIds = (text: string): string[] =>
+  text
+    .split('<task-notification>')
+    .slice(1)
+    .flatMap(block => {
+      const id = /<task-id>([^<]+)<\/task-id>/.exec(block)?.[1]?.trim() ?? ''
+      const status = /<status>([^<]+)<\/status>/.exec(block)?.[1]?.trim().toLowerCase() ?? ''
+      return id !== '' && ENDED.has(status) ? [id] : []
+    })
+
+/** The in-flight background work a stop's snapshot lists (`background_tasks`), as much of it as the mod reads. */
+export type TaskSnapshot = { id: string; type: string; description: string; command?: string; name?: string }
+
+const SNAPSHOT_KINDS: Record<string, BackgroundKind> = { shell: 'shell', monitor: 'monitor', workflow: 'workflow' }
+
+/**
+ * The tracked tasks as a stop's snapshot leaves them: those it no longer lists are dropped (unless
+ * recorded too recently for it), and the commands, monitors and workflows it lists that the mod did
+ * not see start (a helper's, one from before a /clear) are added without a start time.
+ */
+export const reconcileTasks = (tracked: readonly BackgroundTask[], snapshot: readonly TaskSnapshot[], at: number): BackgroundTask[] => {
+  const listed = new Set(snapshot.map(one => one.id))
+  const kept = tracked.filter(task => listed.has(task.id) || at - task.seenAt < SNAPSHOT_GRACE_MS)
+  const known = new Set(kept.map(task => task.id))
+  const added = snapshot.flatMap((one): BackgroundTask[] => {
+    const kind = SNAPSHOT_KINDS[one.type]
+    if (kind === undefined || known.has(one.id)) return []
+    const detail = clip(kind === 'workflow' ? one.name || one.description : one.description || one.command || '')
+    return [{ id: one.id, kind, label: KIND_LABELS[kind], detail, startedAt: 0, endsBy: 0, seenAt: at }]
+  })
+  return [...kept, ...added].slice(-MAX_TASKS)
+}
+
+/** `12분째` once a minute has passed, by the minute: between turns the band redraws once a minute. */
+export const runningFor = (ms: number): string => (ms < MINUTE ? '' : `${elapsed(Math.floor(ms / MINUTE) * MINUTE)}째`)
+
+const taskNote = (task: BackgroundTask, now: number) =>
+  task.kind === 'monitor' && task.endsBy > 0 && now >= task.endsBy ? '곧 끝나요' : task.startedAt > 0 ? runningFor(now - task.startedAt) : ''
+
+/** `도우미 2명 · 명령 1개 · 모니터 1개`: what is still at work, kind by kind. */
+export const backgroundParts = (helpers: number, list: readonly BackgroundTask[]): string[] => [
+  ...(helpers > 0 ? [`도우미 ${helpers}명`] : []),
+  ...(['shell', 'monitor', 'workflow'] as const).flatMap(kind => {
+    const n = list.filter(task => task.kind === kind).length
+    return n > 0 ? [`${KIND_WORDS[kind]} ${n}개`] : []
+  }),
+]
+
+// The time goes ahead of the words, which are what a narrow band cuts.
+const oneTask = (task: BackgroundTask, now: number) => {
+  const note = taskNote(task, now)
+  return `◌ 백그라운드${note ? ` (${note})` : ''}: ${what(task)}`
+}
+
+/** The dim row of background work beside a turn at work, or below another row; null with none. */
+export const backgroundNote = (list: readonly BackgroundTask[], now: number): StatusRow | null => {
+  if (list.length === 0) return null
+  const text = list.length === 1 ? oneTask(list[0]!, now) : `◌ 백그라운드: ${backgroundParts(0, list).join(' · ')}`
+  return { text, tone: 'dim', bold: false }
+}
+
+/**
+ * The row of what still works once the main turn has ended: helpers blink their dot, as before; a
+ * command or monitor alone is dim, since only a process runs and Claude does not.
+ */
+export const backgroundRow = (helpers: number, asked: boolean, list: readonly BackgroundTask[], now: number, dot: string): StatusRow | null => {
+  const asking = asked ? ' · 승인 요청이 떴었어요' : ''
+  if (list.length === 0) {
+    return helpers > 0 ? { text: `${dot} 백그라운드 도우미 ${helpers}명은 아직 일하는 중${asking}`, tone: 'claude', bold: false } : null
+  }
+  if (helpers === 0) {
+    const text = list.length === 1 ? oneTask(list[0]!, now) : `◌ 백그라운드에서 아직 일하는 중 · ${backgroundParts(0, list).join(' · ')}`
+    return { text, tone: 'dim', bold: false }
+  }
+  return { text: `${dot} 백그라운드에서 아직 일하는 중 · ${backgroundParts(helpers, list).join(' · ')}${asking}`, tone: 'claude', bold: false }
+}
+
 /** The status rows, top first: none before the session's first turn. */
 export const statusRows = (s: StatusInput): StatusRow[] => {
   const { work: w } = s
+  const list = s.tasks ?? []
   const dot = s.beat ? '●' : '○'
   const lead = s.isViewingHelper ? '메인 대화 · ' : ''
   const isFresh = (at: number) => s.now - at < ASK_FRESH_MS
@@ -270,9 +405,11 @@ export const statusRows = (s: StatusInput): StatusRow[] => {
       const more = w.running.length > 1 ? ` 외 ${w.running.length - 1}개` : ''
       line = `지금${notes ? ` (${notes})` : ''}: ${what(first)}${more}`
     }
+    const note = backgroundNote(list, s.now)
     return [
       { text: head, tone: 'claude', bold: true },
       { text: line, tone: 'dim', bold: false },
+      ...(note === null ? [] : [note]),
     ]
   }
 
@@ -287,13 +424,12 @@ export const statusRows = (s: StatusInput): StatusRow[] => {
     const text = w.stopReason === 'refusal' ? '✕ 요청을 거절했어요 · 다르게 말해 보세요' : '✕ 오류로 멈췄어요 · 대화에 뜬 안내를 확인해 주세요'
     rows.push({ text: `${lead}${text}`, tone: 'error', bold: true })
   }
-  if (helperAsk !== undefined) {
-    rows.push({ text: `! 도우미가 승인 요청을 띄웠어요 · ${ago(helperAsk.at)} · ${what(helperAsk)}`, tone: 'warning', bold: true })
-  } else if (s.helpers > 0) {
-    const asking = s.helperAsks.length > 0 ? ' · 승인 요청이 떴었어요' : ''
-    rows.push({ text: `${dot} 백그라운드 도우미 ${s.helpers}명은 아직 일하는 중${asking}`, tone: 'claude', bold: false })
-  }
-  return rows
+  // At most two rows below the head: a fresh ask from a helper, else what still works in the background.
+  const below: Array<StatusRow | null> =
+    helperAsk !== undefined
+      ? [{ text: `! 도우미가 승인 요청을 띄웠어요 · ${ago(helperAsk.at)} · ${what(helperAsk)}`, tone: 'warning', bold: true }, backgroundNote(list, s.now)]
+      : [backgroundRow(s.helpers, s.helperAsks.length > 0, list, s.now, dot)]
+  return [...rows, ...below.filter((row): row is StatusRow => row !== null)]
 }
 
 const BUSY: ReadonlySet<AgentStatus> = new Set(['pending', 'running', 'waiting'])
@@ -376,8 +512,13 @@ const endHelperTurn = async ($: EngineInterface, agentId: string) => {
 // Waits a moment first: a turn that starts right away (a queued prompt) makes the news stale.
 const announceEnd = async ($: EngineInterface, text: string) => {
   if ((await read($, work)).phase === 'working') return
-  const waiting = (await read($, helpers)).length
-  const full = waiting > 0 ? `${text} · 도우미 ${waiting}명은 아직 일하는 중` : text
+  const [waiting, left] = await Promise.all([read($, helpers).then(list => list.length), read($, tasks)])
+  const full =
+    left.length > 0
+      ? `${text} · 백그라운드에서 아직 일하는 중 (${backgroundParts(waiting, left).join(', ')})`
+      : waiting > 0
+        ? `${text} · 도우미 ${waiting}명은 아직 일하는 중`
+        : text
   // The desktop app has no terminal to notify through (`no-surface`), and a bell shows no words.
   const sent = await $.ui.notify(full, { title: 'Claude Code' }).catch(() => undefined)
   if (sent === undefined || !sent.isSent || sent.channel === 'terminal_bell') {
@@ -395,7 +536,7 @@ const endMainTurn = async ($: EngineInterface, e: TurnCompleteInput) => {
   }
 }
 
-const openCall = async ($: EngineInterface, e: ToolCallInput): Promise<string> => {
+const openCall = async ($: EngineInterface, e: ToolCallInput): Promise<Pick<RunningTool, 'id' | 'startedAt'>> => {
   const startedAt = await $.clock.now()
   const tool = String(e.tool)
   const call: RunningTool = {
@@ -406,11 +547,35 @@ const openCall = async ($: EngineInterface, e: ToolCallInput): Promise<string> =
     askedAt: null,
   }
   await update($, work, w => (w.phase === 'working' ? { ...w, tools: w.tools + 1, running: [...w.running, call] } : w))
-  return call.id
+  return { id: call.id, startedAt }
 }
 
 const closeCall = async ($: EngineInterface, id: string) => {
   await update($, work, w => ({ ...w, running: w.running.filter(one => one.id !== id) }))
+}
+
+const dropTasks = async ($: EngineInterface, ids: readonly string[]) => {
+  if (ids.length > 0) await update($, tasks, list => (list.some(task => ids.includes(task.id)) ? list.filter(task => !ids.includes(task.id)) : list))
+}
+
+// A settled call may have left work in the background, or stopped some: its record says which.
+const noteCall = async ($: EngineInterface, e: ToolCallInput, result: ToolCallResult, startedAt: number | undefined) => {
+  if (result.deny !== undefined || result.isError === true) return
+  const tool = String(e.tool)
+  const stopped = stoppedTaskId(tool, result.result)
+  if (stopped !== null) return dropTasks($, [stopped])
+  // A helper's background work is the helper's: its notification goes to the helper, so it shows from a stop's snapshot.
+  if (e.agentId !== undefined) return
+  const now = await $.clock.now()
+  const task = taskFromCall(tool, e, result.result, startedAt ?? now, now)
+  if (task !== null) await update($, tasks, list => [...list.filter(one => one.id !== task.id), task].slice(-MAX_TASKS))
+}
+
+// The main loop stopped and listed what is still in flight: the source of truth for what ended unannounced.
+const applySnapshot = async ($: EngineInterface, snapshot: readonly TaskSnapshot[] | undefined) => {
+  if (snapshot === undefined) return
+  const at = await $.clock.now()
+  await update($, tasks, list => reconcileTasks(list, snapshot, at))
 }
 
 // A prompt the person must answer: the main loop's call it belongs to, or a helper's ask.
@@ -446,6 +611,8 @@ const resetWork = async ($: EngineInterface) => {
   await update($, helpers, () => [])
   await update($, helperTurns, () => [])
   await update($, helperAsks, () => [])
+  // What still runs comes back with the next stop's snapshot.
+  await update($, tasks, () => [])
 }
 
 // After a reload mid-turn the stored status stands, and its ticker starts again.
@@ -677,21 +844,27 @@ export const register: Register = on => {
   })
 
   // What the main loop runs now, for the status rows; a helper's call settling lets go of its ask.
+  // A settled call's record also says what it left running in the background, or stopped.
   on('tool.call', async ($, e, next) => {
     if (e.agentId !== undefined) {
       const { agentId } = e
       try {
-        return await next(e)
+        const result = await next(e)
+        await quietly(noteCall($, e, result, undefined))
+        return result
       } finally {
         await quietly(dropHelperAsk($, agentId, String(e.tool), e))
       }
     }
-    const id = await openCall($, e).catch(() => undefined)
+    const opened = await openCall($, e).catch(() => undefined)
     try {
-      return await next(e)
+      const result = await next(e)
+      // Timed from the call's start: one moved to the background by Ctrl+B or its timeout ran before it returned.
+      await quietly(noteCall($, e, result, opened?.startedAt))
+      return result
     } finally {
-      if (id !== undefined) {
-        await quietly(closeCall($, id))
+      if (opened !== undefined) {
+        await quietly(closeCall($, opened.id))
       }
     }
   })
@@ -719,6 +892,16 @@ export const register: Register = on => {
     }
     return next(e)
   })
+
+  // Each time the main loop stops it lists the session's background work still in flight: what
+  // ended without a notification the band saw drops out here. Its result passes on untouched.
+  on('classic.Stop', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agent_id === undefined) {
+      await quietly(applySnapshot($, e.background_tasks))
+    }
+    return result
+  }).catch(($, e, next) => next(e))
 
   on('session.measure', async ($, e, next) => {
     await update($, usage, () => toUsage(e))
@@ -774,8 +957,12 @@ export const register: Register = on => {
     return result
   }).catch(($, e, next) => next(e))
 
-  // Trace only: what became of a /compact, the band's or typed, and of prompts sent while it waits.
+  // A background task's notification says which tasks ended. The rest is trace only: what became of
+  // a /compact, the band's or typed, and of prompts sent while it waits.
   on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind === 'task-notification') {
+      await quietly(dropTasks($, endedTaskIds(e.text)))
+    }
     const result = await next(e)
     if (waiting !== null || e.text.trim() === '/compact') {
       const outcome = result.drop === undefined ? 'entered' : `dropped: ${result.drop}`
@@ -793,14 +980,15 @@ export const register: Register = on => {
     if (e.props.hasSurvey) {
       return next(e)
     }
-    const [u, w, helperIds, asks, pulse] = await Promise.all([
+    const [u, w, helperIds, asks, pulse, background] = await Promise.all([
       read($, usage),
       read($, work),
       read($, helpers),
       read($, helperAsks),
       read($, beat),
+      read($, tasks),
     ])
-    const isBusy = e.props.isWorking || w.phase === 'working' || helperIds.length > 0
+    const isBusy = e.props.isWorking || w.phase === 'working' || helperIds.length > 0 || background.length > 0
     const hasReset = u !== null && u.limits.some(l => l.resetsAt !== undefined)
     // A turn's start sets the clock, so only the countdown ever needs to ask for the time.
     const stored = hasReset || isBusy ? await read($, clockNow) : 0
@@ -813,6 +1001,7 @@ export const register: Register = on => {
       helpers: helperIds.length,
       helperAsks: asks,
       isViewingHelper: e.props.view.agentId !== undefined,
+      tasks: background,
     })
     if (u === null && status.length === 0) {
       return next(e)
