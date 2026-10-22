@@ -1259,67 +1259,55 @@ test('the head says when a notification or a stored prompt started the turn', as
   expect(triggerOf('composer', undefined)).toBe('')
 })
 
-// The engine starts a prompt's turn before `next(e)` resolves: the bottom holds the prompt until the
-// test has started the turn.
-const heldWorld = (on: TestArgs[1], answer?: WorldOptions['answer']) => {
-  let reached: () => void = () => {}
-  let release: (value: unknown) => void = () => {}
-  let atBottom = new Promise<void>(resolve => (reached = resolve))
-  const world = workWorld(on, {
-    answer,
-    submit: e =>
-      new Promise(resolve => {
-        release = resolve
-        reached()
-      }).then(value => value ?? { text: e.text }),
-  })
-  const run = async ($: TestArgs[0], prompt: Parameters<TestArgs[0]['prompt']['submit']>[0], turnId: string, outcome?: unknown) => {
-    const submitted = $.prompt.submit(prompt)
-    await atBottom
-    atBottom = new Promise<void>(resolve => (reached = resolve))
-    if (outcome === undefined) await $.turn.start({ text: prompt.text, turnId })
-    release(outcome)
-    return submitted
-  }
-  return { ...world, run }
+// The engine may settle a prompt's `next(e)` before its turn's start reaches the hooks: these tests
+// submit the prompt first and start its turn after.
+const headOf = async ($: TestArgs[0], surface: 'terminal' | 'desktop' = 'desktop') => {
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
+  const head = (await statusTexts(ui))[0]
+  await ui.unmount()
+  return head
 }
 
 test('a turn a notification opened says so, and the next one the person starts does not', async ($, on) => {
-  const world = heldWorld(on)
+  workWorld(on)
   await $.session.measure(MEASURE)
-  await world.run($, NOTIFY('b1', 'completed'), 't1')
+  await $.prompt.submit(NOTIFY('b1', 'completed'))
+  await $.turn.start({ text: 'b1 done', turnId: 't1' })
   for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
-    expect((await statusTexts(ui))[0]).toMatch(/^[●○] 알림 받고 작업 중 · 0초$/)
-    await ui.unmount()
+    expect(await headOf($, surface)).toMatch(/^[●○] 알림 받고 작업 중 · 0초$/)
   }
   await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
-  await world.run($, { text: 'next', origin: { kind: 'composer' }, wait: false }, 't2')
-  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
-  expect((await statusTexts(ui))[0]).toMatch(/^[●○] 작업 중 · 0초$/)
-  await ui.unmount()
+  await $.prompt.submit({ text: 'next', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'next', turnId: 't2' })
+  expect(await headOf($)).toMatch(/^[●○] 작업 중 · 0초$/)
 })
 
 test('a stored prompt\'s turn says so and, however long, is not announced', async ($, on) => {
-  const world = heldWorld(on)
+  const world = workWorld(on)
   await $.session.measure(MEASURE)
-  await world.run($, { text: 'check the deploy', origin: { kind: 'scheduled-trigger' }, wait: false }, 't1')
-  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
-  expect((await statusTexts(ui))[0]).toMatch(/^[●○] 예약 작업 중 · 0초$/)
-  await ui.unmount()
+  await $.prompt.submit({ text: 'check the deploy', origin: { kind: 'scheduled-trigger' }, wait: false })
+  await $.turn.start({ text: 'check the deploy', turnId: 't1' })
+  expect(await headOf($)).toMatch(/^[●○] 예약 작업 중 · 0초$/)
   await $.turn.complete({ answer: '', durationMs: 42_000, isAborted: false, turnId: 't1', reason: 'answer' })
   await world.clock.advance(2_000)
   expect(world.toasts).toEqual([])
 })
 
-test('a dropped notification leaves the next turn as the person\'s', async ($, on) => {
-  const world = heldWorld(on)
+test('a notification delivered into a running turn leaves the waiting trigger alone', async ($, on) => {
+  workWorld(on)
   await $.session.measure(MEASURE)
-  await world.run($, NOTIFY('b1', 'completed'), 't1', { drop: 'not now' })
+  await $.prompt.submit({ text: 'check the deploy', origin: { kind: 'scheduled-trigger' }, wait: false })
+  await $.prompt.submit({ ...NOTIFY('b1', 'completed'), turnId: 't0' })
+  await $.turn.start({ text: 'check the deploy', turnId: 't1' })
+  expect(await headOf($)).toMatch(/^[●○] 예약 작업 중 · 0초$/)
+})
+
+test('a dropped notification leaves the next turn as the person\'s', async ($, on) => {
+  workWorld(on, { submit: () => ({ drop: 'not now' }) })
+  await $.session.measure(MEASURE)
+  await $.prompt.submit(NOTIFY('b1', 'completed'))
   await $.turn.start({ text: 'mine', turnId: 't2' })
-  const ui = await $.ui.mount({ plugin: 'usage-mods', surface: 'desktop', component: 'AbovePrompt', props: { ...PROPS, isWorking: true } })
-  expect((await statusTexts(ui))[0]).toMatch(/^[●○] 작업 중 · 0초$/)
-  await ui.unmount()
+  expect(await headOf($)).toMatch(/^[●○] 작업 중 · 0초$/)
 })
 
 test('a schedule weeks away still turns to 곧 실행 on time: the clock wakes within the hour and looks again', { timeoutMs: 60_000 }, async ($, on) => {

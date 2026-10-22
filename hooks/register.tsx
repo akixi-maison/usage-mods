@@ -1118,6 +1118,8 @@ export const register: Register = on => {
 
   // The plugin's own record of a running turn, beside the band's isWorking: the button is off while either says so.
   on('turn.start', async ($, e, next) => {
+    // Taken before anything waits: the prompt that started the turn may settle meanwhile.
+    const trigger = e.agentId === undefined ? takeTrigger() : ''
     // A helper's turn is not the main one: turn.complete clears this for the main loop alone.
     if (e.agentId === undefined) {
       await update($, isTurnRunning, () => true)
@@ -1125,7 +1127,7 @@ export const register: Register = on => {
     if (waiting !== null) {
       trace($, `turn started while /compact waits: ${describePrompt(e.text)}`)
     }
-    await quietly(e.agentId === undefined ? startMainTurn($, takeTrigger()) : startHelperTurn($, e.agentId))
+    await quietly(e.agentId === undefined ? startMainTurn($, trigger) : startHelperTurn($, e.agentId))
     return next(e)
   })
 
@@ -1173,18 +1175,23 @@ export const register: Register = on => {
     } else if (e.origin.kind === 'scheduled-trigger') {
       await quietly(fireStored($, e.text))
     }
-    // `next(e)` resolves once the prompt's turn has started, so the turn's start reads what started it.
-    pendingTrigger = triggerOf(e.origin.kind, e.turnId)
+    // Left for the turn this prompt opens (the person's own opens one too, started by nobody else):
+    // the engine may settle `next(e)` before that turn's start reaches the hooks, so it is taken
+    // there. A prompt delivered into a running turn opens none and leaves a waiting one alone.
+    const opensTurn = e.turnId === undefined
+    if (opensTurn) pendingTrigger = triggerOf(e.origin.kind, e.turnId)
     try {
       const result = await next(e)
+      // Dropped: no turn of it will start.
+      if (result.drop !== undefined && opensTurn) pendingTrigger = ''
       if (waiting !== null || e.text.trim() === '/compact') {
         const outcome = result.drop === undefined ? 'entered' : `dropped: ${result.drop}`
         trace($, `prompt from ${e.origin.kind}: ${describePrompt(e.text)}, ${outcome}`)
       }
       return result
-    } finally {
-      // Dropped, or queued behind a running turn: whatever starts next was not started by this.
-      pendingTrigger = ''
+    } catch (error) {
+      if (opensTurn) pendingTrigger = ''
+      throw error
     }
   }).catch(($, e, next) => next(e))
 
