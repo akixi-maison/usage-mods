@@ -348,7 +348,7 @@ const oneTask = (task: BackgroundTask, now: number) => {
 // --- Schedules ---
 
 /** The sentinels /loop stores in place of a prompt; the prompt that fires is the loop's own text. */
-const LOOP_SENTINEL = /^<<(autonomous-loop(-dynamic)?|loop\.md)>>$/
+const LOOP_SENTINEL = /^<<(autonomous-loop|loop\.md)(-dynamic)?>>$/
 
 const isLoop = (prompt: string) => LOOP_SENTINEL.test(prompt.trim())
 
@@ -410,8 +410,9 @@ export const reconcileSchedules = (tracked: readonly Schedule[], snapshot: reado
   const claimed = new Set(tracked.map(one => one.id).filter(id => listed.has(id)))
   const kept = tracked.flatMap((one): Schedule[] => {
     const job = listed.get(one.id)
-    // A recurring job whose run the band did not see has a next run it cannot tell.
-    if (job !== undefined) return [{ ...one, recurring: job.recurring, nextAt: job.recurring && one.nextAt > 0 && one.nextAt <= at ? 0 : one.nextAt }]
+    // A past time stays: a job due while a turn ran fires right after it, and fireSchedule finds it
+    // by that time. The rows stop showing a recurring job's time once it is a minute past (nextAtOf).
+    if (job !== undefined) return [{ ...one, recurring: job.recurring }]
     if (one.kind === 'wakeup' && one.id.startsWith('wakeup@')) {
       const twin = snapshot.find(job => !job.recurring && !claimed.has(job.id) && clip(job.prompt) === one.prompt)
       if (twin !== undefined) {

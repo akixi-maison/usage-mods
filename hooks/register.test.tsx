@@ -772,6 +772,7 @@ test('a settled call\'s record tells which schedule it stored, deleted or ended'
   expect(stopsWakeups('ScheduleWakeup', { scheduledFor: T0 })).toBe(false)
   expect(promptWords('<<autonomous-loop>>')).toBe('/loop')
   expect(promptWords('<<loop.md>>')).toBe('/loop')
+  expect(promptWords('<<loop.md-dynamic>>')).toBe('/loop')
   expect(describeTool('CronCreate', { cron: '*/10 * * * *', prompt: '<<autonomous-loop>>' }).detail).toBe('/loop')
   expect(describeTool('ScheduleWakeup', { delaySeconds: 60, prompt: '<<autonomous-loop-dynamic>>' }).detail).toBe('/loop')
   expect(promptWords('  /loop 5m   check ... [+20 chars]')).toBe('/loop 5m check')
@@ -805,12 +806,16 @@ test('a stop\'s snapshot keeps the listed schedules, names a wakeup, and drops o
   // The wakeup keeps its time and words under the job's id.
   expect(after[1]).toEqual({ ...wakeup, id: 'w7' })
   expect(after[3]).toEqual({ id: 'c9', kind: 'cron', recurring: true, nextAt: 0, detail: 'hourly report', prompt: 'hourly report', seenAt: at })
-  // A recurring job whose run the band missed loses its past time; a one-shot still due keeps it.
-  const missed = reconcileSchedules([plan({ recurring: true, nextAt: at - MIN }), plan({ id: 'c2', nextAt: at - MIN })], [
-    { id: 'c1', schedule: '* * * * *', recurring: true, prompt: 'check the deploy' },
-    { id: 'c2', schedule: '1 2 3 4 *', recurring: false, prompt: 'check the deploy' },
+  // A past time stays through a snapshot: a /loop due while a turn ran fires right after it and is
+  // found by that time, not mistaken for the one-shot due next.
+  const loop = plan({ id: 'l1', recurring: true, prompt: '<<autonomous-loop>>', detail: '/loop', nextAt: at - 10_000 })
+  const later = plan({ id: 'c2', prompt: 'remind me', detail: 'remind me', nextAt: at + 50_000 })
+  const kept = reconcileSchedules([loop, later], [
+    { id: 'l1', schedule: '*/5 * * * *', recurring: true, prompt: '<<autonomous-loop>>' },
+    { id: 'c2', schedule: '1 2 3 4 *', recurring: false, prompt: 'remind me' },
   ], at)
-  expect(missed.map(one => one.nextAt)).toEqual([0, at - MIN])
+  expect(kept.map(one => one.nextAt)).toEqual([at - 10_000, at + 50_000])
+  expect(fireSchedule(kept, 'check the build and report', at + 1_000)).toEqual([{ ...loop, nextAt: 0 }, later])
 })
 
 test('the schedule rows: one with its time and words, several with the next run', async () => {
