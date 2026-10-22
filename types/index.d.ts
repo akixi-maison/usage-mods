@@ -44,6 +44,22 @@ export type BackgroundTask = {
   seenAt: number
 }
 
+/** A stored prompt that will start a turn later: a cron job, or a /loop wakeup. */
+export type Schedule = {
+  /** The cron job's id; a wakeup is `wakeup@<epoch ms>` until a stop's snapshot names it. */
+  id: string
+  kind: 'cron' | 'wakeup'
+  recurring: boolean
+  /** Epoch ms of its next run; 0 when not known (a recurring job after it ran, one seen only in a snapshot). */
+  nextAt: number
+  /** What it will do, in a few words: the wakeup's reason, else the prompt. */
+  detail: string
+  /** The prompt's head, one line, to match it when it fires. */
+  prompt: string
+  /** Epoch ms the mod recorded it: a snapshot taken a moment earlier may not list it yet. */
+  seenAt: number
+}
+
 export type Work = {
   phase: Phase
   /** Epoch ms the main turn started; 0 when not known. */
@@ -74,6 +90,8 @@ declare module 'claude-code' {
       helperAsks: HelperAsk[]
       /** Background commands, monitors and workflow runs still at work, oldest first. */
       tasks: BackgroundTask[]
+      /** Cron jobs and wakeups that will start a turn later. */
+      schedules: Schedule[]
     }
   }
 }

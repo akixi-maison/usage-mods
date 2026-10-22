@@ -11,7 +11,7 @@ import type {
   TurnCompleteInput,
 } from 'claude-code'
 
-import type { BackgroundKind, BackgroundTask, HelperAsk, Phase, RunningTool, Usage, Work } from '../types'
+import type { BackgroundKind, BackgroundTask, HelperAsk, Phase, RunningTool, Schedule, Usage, Work } from '../types'
 
 const IDLE_WORK: Work = { phase: 'idle', startedAt: 0, durationMs: 0, tools: 0, running: [], stopReason: '' }
 
@@ -25,6 +25,7 @@ const helpers = atom({ plugin: 'usage-mods', key: 'helpers' } as const, [] as st
 const helperTurns = atom({ plugin: 'usage-mods', key: 'helperTurns' } as const, [] as string[])
 const helperAsks = atom({ plugin: 'usage-mods', key: 'helperAsks' } as const, [] as HelperAsk[])
 const tasks = atom({ plugin: 'usage-mods', key: 'tasks' } as const, [] as BackgroundTask[])
+const schedules = atom({ plugin: 'usage-mods', key: 'schedules' } as const, [] as Schedule[])
 
 const LABELS: Record<string, string> = { five_hour: '5시간', seven_day: '7일', spend_limit: '한도' }
 
@@ -101,8 +102,11 @@ const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
 /** `3일 0시간` from a day out, `2시간 13분` within one, `13분` within the hour. */
-export const timeLeft = (resetsAt: string, now: number): string => {
-  const ms = Math.max(0, Date.parse(resetsAt) - now)
+export const timeLeft = (resetsAt: string, now: number): string => timeLeftMs(Date.parse(resetsAt) - now)
+
+/** The same words for a span of milliseconds. */
+export const timeLeftMs = (span: number): string => {
+  const ms = Math.max(0, span)
   const days = Math.floor(ms / DAY)
   const hours = Math.floor((ms % DAY) / HOUR)
   const minutes = Math.floor((ms % HOUR) / MINUTE)
@@ -173,6 +177,10 @@ const TOOL_WORDS: Record<string, ToolWords> = {
   Workflow: { label: '도우미 여러 명 돌리기' },
   Monitor: { label: '지켜보기 시작', detail: pick => pick('description') },
   TaskStop: { label: '백그라운드 작업 멈추기', detail: pick => pick('task_id') || pick('shell_id') },
+  CronCreate: { label: '예약 만들기', detail: pick => pick('prompt') },
+  CronDelete: { label: '예약 지우기', detail: pick => pick('id') },
+  CronList: { label: '예약 확인' },
+  ScheduleWakeup: { label: '다음 실행 예약', detail: pick => pick('reason') },
   Skill: { label: '스킬 불러오기', detail: pick => pick('skill') },
   ToolSearch: { label: '도구 찾기' },
   TodoWrite: { label: '할 일 정리' },
@@ -189,7 +197,11 @@ export const describeTool = (tool: string, input: unknown): Pick<RunningTool, 'l
   }
   const words = TOOL_WORDS[tool]
   const isBackground = (tool === 'Bash' || tool === 'PowerShell') && args['run_in_background'] === true
-  const label = isBackground ? '백그라운드로 명령 실행' : words?.label ?? `도구 사용: ${/^mcp__.+?__(.+)$/.exec(tool)?.[1] ?? tool}`
+  const label = isBackground
+    ? '백그라운드로 명령 실행'
+    : tool === 'ScheduleWakeup' && args['stop'] === true
+      ? '반복 멈추기'
+      : words?.label ?? `도구 사용: ${/^mcp__.+?__(.+)$/.exec(tool)?.[1] ?? tool}`
   const detail = (words?.detail?.(pick) ?? '').replace(/\s+/g, ' ').trim().slice(0, 80)
   return { label, detail, needsMe: words?.needsMe === true }
 }
@@ -215,6 +227,8 @@ export type StatusInput = {
   isViewingHelper: boolean
   /** Background commands, monitors and workflow runs still at work. */
   tasks?: readonly BackgroundTask[]
+  /** Cron jobs and wakeups that will start a turn later. */
+  schedules?: readonly Schedule[]
 }
 
 const what = (one: { label: string; detail: string }) => (one.detail ? `${one.label} — ${one.detail}` : one.label)
@@ -323,11 +337,121 @@ const oneTask = (task: BackgroundTask, now: number) => {
   return `◌ 백그라운드${note ? ` (${note})` : ''}: ${what(task)}`
 }
 
-/** The dim row of background work beside a turn at work, or below another row; null with none. */
-export const backgroundNote = (list: readonly BackgroundTask[], now: number): StatusRow | null => {
+// --- Schedules ---
+
+/** The /loop sentinels a wakeup stores in place of a prompt. */
+const LOOP_SENTINEL = /^<<autonomous-loop(-dynamic)?>>$/
+
+/** A stored prompt in a few words; a /loop's sentinel reads as a repeating task. */
+export const promptWords = (prompt: string): string => (LOOP_SENTINEL.test(prompt.trim()) ? '반복 작업' : clip(prompt))
+
+/** The cron job or wakeup a settled call stored; null for any other call, and for a wakeup's stop. */
+export const scheduleFromCall = (tool: string, input: unknown, record: unknown, now: number): Schedule | null => {
+  const r = asRecord(record)
+  const args = asRecord(input)
+  const prompt = str(args['prompt'])
+  if (tool === 'CronCreate') {
+    const id = str(r['id'])
+    const nextAt = typeof r['nextFireAt'] === 'number' ? r['nextFireAt'] : 0
+    const recurring = r['recurring'] !== false
+    return id === '' ? null : { id, kind: 'cron', recurring, nextAt, detail: promptWords(prompt), prompt: clip(prompt), seenAt: now }
+  }
+  if (tool === 'ScheduleWakeup') {
+    const at = typeof r['scheduledFor'] === 'number' ? r['scheduledFor'] : 0
+    if (r['stopped'] === true || at <= 0) return null
+    const detail = clip(str(args['reason'])) || promptWords(prompt)
+    return { id: `wakeup@${at}`, kind: 'wakeup', recurring: false, nextAt: at, detail, prompt: clip(prompt), seenAt: now }
+  }
+  return null
+}
+
+/** The cron job a settled CronDelete removed; null for any other call. */
+export const deletedScheduleId = (tool: string, record: unknown): string | null =>
+  tool === 'CronDelete' ? str(asRecord(record)['id']) || null : null
+
+/** Whether a settled call ended the /loop: its pending wakeups go, a recurring cron stays. */
+export const stopsWakeups = (tool: string, record: unknown): boolean => tool === 'ScheduleWakeup' && asRecord(record)['stopped'] === true
+
+/**
+ * The schedules once a stored prompt fired: the one with that prompt, else the earliest one-shot
+ * due within the minute. A one-shot goes; a recurring one stays, its next run unknown.
+ */
+export const fireSchedule = (list: readonly Schedule[], text: string, now: number): Schedule[] => {
+  const head = clip(text)
+  const due = list.filter(one => !one.recurring && one.nextAt > 0 && one.nextAt <= now + MINUTE).sort((a, b) => a.nextAt - b.nextAt)
+  const fired = list.find(one => one.prompt !== '' && one.prompt === head) ?? due[0]
+  if (fired === undefined) return [...list]
+  return fired.recurring ? list.map(one => (one === fired ? { ...one, nextAt: 0 } : one)) : list.filter(one => one !== fired)
+}
+
+/** The cron jobs a stop's snapshot lists (`session_crons`). */
+export type CronSnapshot = { id: string; schedule: string; recurring: boolean; prompt: string }
+
+/**
+ * The tracked schedules as a stop's snapshot leaves them: listed ones kept, a wakeup the mod named by
+ * its time takes the id of the one-shot job with its prompt, missing ones dropped (unless recorded too
+ * recently), and jobs it did not see made (a helper's, one from before a /clear) added without a time.
+ */
+export const reconcileSchedules = (tracked: readonly Schedule[], snapshot: readonly CronSnapshot[], at: number): Schedule[] => {
+  const listed = new Map(snapshot.map(one => [one.id, one]))
+  const claimed = new Set(tracked.map(one => one.id).filter(id => listed.has(id)))
+  const kept = tracked.flatMap((one): Schedule[] => {
+    const job = listed.get(one.id)
+    if (job !== undefined) return [{ ...one, recurring: job.recurring }]
+    if (one.kind === 'wakeup' && one.id.startsWith('wakeup@')) {
+      const twin = snapshot.find(job => !job.recurring && !claimed.has(job.id) && clip(job.prompt) === one.prompt)
+      if (twin !== undefined) {
+        claimed.add(twin.id)
+        return [{ ...one, id: twin.id }]
+      }
+    }
+    return at - one.seenAt < SNAPSHOT_GRACE_MS ? [one] : []
+  })
+  const added = snapshot
+    .filter(job => !claimed.has(job.id))
+    .map((job): Schedule => ({
+      id: job.id,
+      kind: job.recurring ? 'cron' : 'wakeup',
+      recurring: job.recurring,
+      nextAt: 0,
+      detail: promptWords(job.prompt),
+      prompt: clip(job.prompt),
+      seenAt: at,
+    }))
+  return [...kept, ...added].slice(-MAX_TASKS)
+}
+
+/** `4분 후`, `1시간 2분 후`; `곧` within the minute or past due; '' when not known. */
+export const timeTo = (at: number, now: number): string => (at <= 0 ? '' : at - now < MINUTE ? '곧' : `${timeLeftMs(at - now)} 후`)
+
+const nextRun = (list: readonly Schedule[], now: number) => {
+  const known = list.filter(one => one.nextAt > 0).sort((a, b) => a.nextAt - b.nextAt)[0]
+  return known === undefined ? '' : timeTo(known.nextAt, now)
+}
+
+/** `◷ 4분 후 실행 · 배포 상태 확인`, `◷ 예약 3개 · 다음은 곧 실행`; null with none. */
+export const scheduleRow = (list: readonly Schedule[], now: number): StatusRow | null => {
   if (list.length === 0) return null
-  const text = list.length === 1 ? oneTask(list[0]!, now) : `◌ 백그라운드: ${backgroundParts(0, list).join(' · ')}`
-  return { text, tone: 'dim', bold: false }
+  if (list.length === 1) {
+    const one = list[0]!
+    const when = timeTo(one.nextAt, now)
+    const head = when !== '' ? `${when} 실행` : one.recurring ? '반복 예약' : '예약'
+    return { text: `◷ ${head}${one.detail ? ` · ${one.detail}` : ''}`, tone: 'dim', bold: false }
+  }
+  const next = nextRun(list, now)
+  return { text: `◷ 예약 ${list.length}개${next === '' ? '' : ` · 다음은 ${next === '곧' ? '곧 실행' : next}`}`, tone: 'dim', bold: false }
+}
+
+/**
+ * The one dim row of background work and schedules beside a turn at work, or below a helper's ask;
+ * null with neither.
+ */
+export const backgroundNote = (list: readonly BackgroundTask[], planned: readonly Schedule[], now: number): StatusRow | null => {
+  if (list.length === 0) return scheduleRow(planned, now)
+  if (planned.length === 0 && list.length === 1) return { text: oneTask(list[0]!, now), tone: 'dim', bold: false }
+  const next = nextRun(planned, now)
+  const later = planned.length === 0 ? [] : [`예약 ${planned.length}개${next === '' ? '' : ` (${next === '곧' ? '곧 실행' : next})`}`]
+  return { text: `◌ 백그라운드: ${[...backgroundParts(0, list), ...later].join(' · ')}`, tone: 'dim', bold: false }
 }
 
 /**
@@ -350,6 +474,7 @@ export const backgroundRow = (helpers: number, asked: boolean, list: readonly Ba
 export const statusRows = (s: StatusInput): StatusRow[] => {
   const { work: w } = s
   const list = s.tasks ?? []
+  const planned = s.schedules ?? []
   const dot = s.beat ? '●' : '○'
   const lead = s.isViewingHelper ? '메인 대화 · ' : ''
   const isFresh = (at: number) => s.now - at < ASK_FRESH_MS
@@ -405,7 +530,7 @@ export const statusRows = (s: StatusInput): StatusRow[] => {
       const more = w.running.length > 1 ? ` 외 ${w.running.length - 1}개` : ''
       line = `지금${notes ? ` (${notes})` : ''}: ${what(first)}${more}`
     }
-    const note = backgroundNote(list, s.now)
+    const note = backgroundNote(list, planned, s.now)
     return [
       { text: head, tone: 'claude', bold: true },
       { text: line, tone: 'dim', bold: false },
@@ -424,11 +549,12 @@ export const statusRows = (s: StatusInput): StatusRow[] => {
     const text = w.stopReason === 'refusal' ? '✕ 요청을 거절했어요 · 다르게 말해 보세요' : '✕ 오류로 멈췄어요 · 대화에 뜬 안내를 확인해 주세요'
     rows.push({ text: `${lead}${text}`, tone: 'error', bold: true })
   }
-  // At most two rows below the head: a fresh ask from a helper, else what still works in the background.
+  // At most two rows below the head: a fresh ask from a helper over one dim row of the rest, else
+  // what still works in the background over what is scheduled.
   const below: Array<StatusRow | null> =
     helperAsk !== undefined
-      ? [{ text: `! 도우미가 승인 요청을 띄웠어요 · ${ago(helperAsk.at)} · ${what(helperAsk)}`, tone: 'warning', bold: true }, backgroundNote(list, s.now)]
-      : [backgroundRow(s.helpers, s.helperAsks.length > 0, list, s.now, dot)]
+      ? [{ text: `! 도우미가 승인 요청을 띄웠어요 · ${ago(helperAsk.at)} · ${what(helperAsk)}`, tone: 'warning', bold: true }, backgroundNote(list, planned, s.now)]
+      : [backgroundRow(s.helpers, s.helperAsks.length > 0, list, s.now, dot), scheduleRow(planned, s.now)]
   return [...rows, ...below.filter((row): row is StatusRow => row !== null)]
 }
 
@@ -558,24 +684,69 @@ const dropTasks = async ($: EngineInterface, ids: readonly string[]) => {
   if (ids.length > 0) await update($, tasks, list => (list.some(task => ids.includes(task.id)) ? list.filter(task => !ids.includes(task.id)) : list))
 }
 
-// A settled call may have left work in the background, or stopped some: its record says which.
+// The module's own, as the work ticker is: a reload drops it, and session.start arms it again.
+let scheduleTimer: Timer | undefined
+
+// Redraws the moment the nearest schedule turns `곧`, which the minute clock may miss by most of a minute.
+const armScheduleClock = async ($: EngineInterface) => {
+  scheduleTimer?.cancel()
+  scheduleTimer = undefined
+  const [list, now] = await Promise.all([read($, schedules), $.clock.now()])
+  const turns = list.map(one => one.nextAt - MINUTE).filter(at => at >= now)
+  if (turns.length > 0) {
+    scheduleTimer = $.clock.after(Math.min(...turns) - now + 1, () => void tick($).then(() => armScheduleClock($)))
+  }
+}
+
+const changeSchedules = async ($: EngineInterface, change: (list: Schedule[]) => Schedule[]) => {
+  await update($, schedules, change)
+  await armScheduleClock($)
+}
+
+// A call that stores, deletes or ends a schedule; false for any other.
+const noteSchedule = async ($: EngineInterface, tool: string, input: unknown, record: unknown, now: number): Promise<boolean> => {
+  const deleted = deletedScheduleId(tool, record)
+  if (deleted !== null) {
+    await changeSchedules($, list => list.filter(one => one.id !== deleted))
+    return true
+  }
+  if (stopsWakeups(tool, record)) {
+    await changeSchedules($, list => list.filter(one => one.kind !== 'wakeup'))
+    return true
+  }
+  const planned = scheduleFromCall(tool, input, record, now)
+  if (planned === null) return false
+  await changeSchedules($, list => [...list.filter(one => one.id !== planned.id), planned].slice(-MAX_TASKS))
+  return true
+}
+
+// A settled call may have left work in the background, stopped some, or stored a schedule: its record says which.
 const noteCall = async ($: EngineInterface, e: ToolCallInput, result: ToolCallResult, startedAt: number | undefined) => {
   if (result.deny !== undefined || result.isError === true) return
   const tool = String(e.tool)
+  const now = await $.clock.now()
+  // Schedules are the session's, whichever loop stored them.
+  if (await noteSchedule($, tool, e, result.result, now)) return
   const stopped = stoppedTaskId(tool, result.result)
   if (stopped !== null) return dropTasks($, [stopped])
   // A helper's background work is the helper's: its notification goes to the helper, so it shows from a stop's snapshot.
   if (e.agentId !== undefined) return
-  const now = await $.clock.now()
   const task = taskFromCall(tool, e, result.result, startedAt ?? now, now)
   if (task !== null) await update($, tasks, list => [...list.filter(one => one.id !== task.id), task].slice(-MAX_TASKS))
 }
 
-// The main loop stopped and listed what is still in flight: the source of truth for what ended unannounced.
-const applySnapshot = async ($: EngineInterface, snapshot: readonly TaskSnapshot[] | undefined) => {
-  if (snapshot === undefined) return
+// A stored prompt fired: its schedule has run.
+const fireStored = async ($: EngineInterface, text: string) => {
+  const now = await $.clock.now()
+  await changeSchedules($, list => fireSchedule(list, text, now))
+}
+
+// The main loop stopped and listed what is still in flight and scheduled: the source of truth for
+// what ended, expired or was made unseen. A field the engine left out changes nothing.
+const applySnapshot = async ($: EngineInterface, snapshot: readonly TaskSnapshot[] | undefined, crons: readonly CronSnapshot[] | undefined) => {
   const at = await $.clock.now()
-  await update($, tasks, list => reconcileTasks(list, snapshot, at))
+  if (snapshot !== undefined) await update($, tasks, list => reconcileTasks(list, snapshot, at))
+  if (crons !== undefined) await changeSchedules($, list => reconcileSchedules(list, crons, at))
 }
 
 // A prompt the person must answer: the main loop's call it belongs to, or a helper's ask.
@@ -611,8 +782,11 @@ const resetWork = async ($: EngineInterface) => {
   await update($, helpers, () => [])
   await update($, helperTurns, () => [])
   await update($, helperAsks, () => [])
-  // What still runs comes back with the next stop's snapshot.
+  // What still runs, or is still scheduled, comes back with the next stop's snapshot.
   await update($, tasks, () => [])
+  await update($, schedules, () => [])
+  scheduleTimer?.cancel()
+  scheduleTimer = undefined
 }
 
 // After a reload mid-turn the stored status stands, and its ticker starts again.
@@ -832,6 +1006,7 @@ export const register: Register = on => {
     await tick($)
     $.clock.every(MINUTE, () => void tick($))
     await quietly(resumeWork($))
+    await quietly(armScheduleClock($))
     return result
   })
 
@@ -898,7 +1073,7 @@ export const register: Register = on => {
   on('classic.Stop', async ($, e, next) => {
     const result = await next(e)
     if (e.agent_id === undefined) {
-      await quietly(applySnapshot($, e.background_tasks))
+      await quietly(applySnapshot($, e.background_tasks, e.session_crons))
     }
     return result
   }).catch(($, e, next) => next(e))
@@ -962,6 +1137,8 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'task-notification') {
       await quietly(dropTasks($, endedTaskIds(e.text)))
+    } else if (e.origin.kind === 'scheduled-trigger') {
+      await quietly(fireStored($, e.text))
     }
     const result = await next(e)
     if (waiting !== null || e.text.trim() === '/compact') {
@@ -980,15 +1157,16 @@ export const register: Register = on => {
     if (e.props.hasSurvey) {
       return next(e)
     }
-    const [u, w, helperIds, asks, pulse, background] = await Promise.all([
+    const [u, w, helperIds, asks, pulse, background, planned] = await Promise.all([
       read($, usage),
       read($, work),
       read($, helpers),
       read($, helperAsks),
       read($, beat),
       read($, tasks),
+      read($, schedules),
     ])
-    const isBusy = e.props.isWorking || w.phase === 'working' || helperIds.length > 0 || background.length > 0
+    const isBusy = e.props.isWorking || w.phase === 'working' || helperIds.length > 0 || background.length > 0 || planned.length > 0
     const hasReset = u !== null && u.limits.some(l => l.resetsAt !== undefined)
     // A turn's start sets the clock, so only the countdown ever needs to ask for the time.
     const stored = hasReset || isBusy ? await read($, clockNow) : 0
@@ -1002,6 +1180,7 @@ export const register: Register = on => {
       helperAsks: asks,
       isViewingHelper: e.props.view.agentId !== undefined,
       tasks: background,
+      schedules: planned,
     })
     if (u === null && status.length === 0) {
       return next(e)

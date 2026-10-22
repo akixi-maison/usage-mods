@@ -2,7 +2,7 @@ import type { AgentInfo } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import type { BackgroundTask, Work } from '../types'
+import type { BackgroundTask, Schedule, Work } from '../types'
 import {
   appendLine,
   ASK_FRESH_MS,
@@ -14,10 +14,12 @@ import {
   barSvg,
   canCompact,
   costText,
+  deletedScheduleId,
   describePrompt,
   describeTool,
   elapsed,
   endedTaskIds,
+  fireSchedule,
   hasCompacted,
   hoverParts,
   hoverText,
@@ -27,14 +29,20 @@ import {
   meterColor,
   meters,
   OFF_HINT,
+  promptWords,
   QUEUE_TIMEOUT,
+  reconcileSchedules,
   reconcileTasks,
   runningFor,
+  scheduleFromCall,
+  scheduleRow,
   shouldSendCompact,
   SNAPSHOT_GRACE_MS,
   statusRows,
   stoppedTaskId,
+  stopsWakeups,
   taskFromCall,
+  timeTo,
   weeklyReset,
 } from './register'
 
@@ -704,8 +712,8 @@ test('the background rows: one task with its time, several by kind, helpers keep
   // Helpers alone keep the words they had.
   expect(backgroundRow(2, false, [], now, '○')?.text).toBe('○ 백그라운드 도우미 2명은 아직 일하는 중')
   expect(backgroundRow(0, false, [], now, '●')).toBeNull()
-  expect(backgroundNote([task(), task({ id: 'b2' }), monitor], now)?.text).toBe('◌ 백그라운드: 명령 2개 · 모니터 1개')
-  expect(backgroundNote([], now)).toBeNull()
+  expect(backgroundNote([task(), task({ id: 'b2' }), monitor], [], now)?.text).toBe('◌ 백그라운드: 명령 2개 · 모니터 1개')
+  expect(backgroundNote([], [], now)).toBeNull()
 })
 
 test('the status rows with background work: a dim third row while working, below the end after', async () => {
@@ -729,6 +737,92 @@ test('the status rows with background work: a dim third row while working, below
   // Before any turn, after a /clear: the background row alone.
   expect(texts(statusRows({ ...STATUS, isWorking: false, work: { ...WORKING, phase: 'idle' }, now, tasks: [task({ startedAt: 0 })] })))
     .toEqual(['◌ 백그라운드: 명령 실행 — Run dev server'])
+})
+
+// --- Schedules -----------------------------------------------------------------------------------
+
+const plan = (over: Partial<Schedule> = {}): Schedule => ({
+  id: 'c1', kind: 'cron', recurring: false, nextAt: T0 + 4 * MIN, detail: 'check the deploy', prompt: 'check the deploy', seenAt: T0, ...over,
+})
+
+test('the schedule tools in plain words', async () => {
+  expect(describeTool('CronCreate', { cron: '*/5 * * * *', prompt: 'check the deploy' })).toEqual({ label: '예약 만들기', detail: 'check the deploy', needsMe: false })
+  expect(describeTool('CronDelete', { id: 'c1' }).label).toBe('예약 지우기')
+  expect(describeTool('ScheduleWakeup', { delaySeconds: 240, reason: 'watching the build', prompt: '/loop check' })).toEqual({ label: '다음 실행 예약', detail: 'watching the build', needsMe: false })
+  expect(describeTool('ScheduleWakeup', { stop: true }).label).toBe('반복 멈추기')
+})
+
+test('a settled call\'s record tells which schedule it stored, deleted or ended', async () => {
+  expect(scheduleFromCall('CronCreate', { cron: '*/5 * * * *', prompt: 'check the deploy' }, { id: 'c1', humanSchedule: 'every 5 minutes', recurring: true, nextFireAt: T0 + 4 * MIN }, T0))
+    .toEqual(plan({ recurring: true }))
+  expect(scheduleFromCall('CronCreate', { cron: '0 9 * * *', prompt: 'p' }, { id: 'c2', humanSchedule: '', recurring: false }, T0)?.nextAt).toBe(0)
+  expect(scheduleFromCall('ScheduleWakeup', { delaySeconds: 240, reason: 'watching the build', prompt: '<<autonomous-loop-dynamic>>' }, { scheduledFor: T0 + 4 * MIN, clampedDelaySeconds: 240, wasClamped: false }, T0))
+    .toEqual({ id: `wakeup@${T0 + 4 * MIN}`, kind: 'wakeup', recurring: false, nextAt: T0 + 4 * MIN, detail: 'watching the build', prompt: '<<autonomous-loop-dynamic>>', seenAt: T0 })
+  expect(scheduleFromCall('ScheduleWakeup', { prompt: '<<autonomous-loop-dynamic>>' }, { scheduledFor: T0 + MIN }, T0)?.detail).toBe('반복 작업')
+  expect(scheduleFromCall('ScheduleWakeup', { stop: true }, { scheduledFor: 0, stopped: true, cancelledWakeups: 1 }, T0)).toBeNull()
+  expect(scheduleFromCall('Bash', {}, { id: 'x' }, T0)).toBeNull()
+  expect(deletedScheduleId('CronDelete', { id: 'c1' })).toBe('c1')
+  expect(deletedScheduleId('CronCreate', { id: 'c1' })).toBeNull()
+  expect(stopsWakeups('ScheduleWakeup', { stopped: true })).toBe(true)
+  expect(stopsWakeups('ScheduleWakeup', { scheduledFor: T0 })).toBe(false)
+  expect(promptWords('<<autonomous-loop>>')).toBe('반복 작업')
+  expect(promptWords('  /loop 5m   check ... [+20 chars]')).toBe('/loop 5m check')
+})
+
+test('a fired prompt ends its one-shot schedule and leaves a recurring one with no known next run', async () => {
+  const list = [plan(), plan({ id: 'c2', recurring: true, prompt: 'every hour', detail: 'every hour', nextAt: T0 + 60 * MIN })]
+  expect(fireSchedule(list, 'check the deploy', T0 + 4 * MIN).map(one => one.id)).toEqual(['c2'])
+  expect(fireSchedule(list, 'every hour', T0 + 60 * MIN)).toEqual([list[0], { ...list[1], nextAt: 0 }])
+  // A prompt that came changed: the one-shot due within the minute is the one that fired.
+  expect(fireSchedule(list, 'something else', T0 + 4 * MIN - 30_000).map(one => one.id)).toEqual(['c2'])
+  // Nothing due and nothing matching: nothing goes; a recurring one is never taken by time alone.
+  expect(fireSchedule(list, 'something else', T0)).toEqual(list)
+  expect(fireSchedule([list[1]!], 'something else', T0 + 60 * MIN)).toEqual([list[1]])
+})
+
+test('a stop\'s snapshot keeps the listed schedules, names a wakeup, and drops or adds the rest', async () => {
+  const at = T0 + 10 * MIN
+  const wakeup = plan({ id: `wakeup@${T0 + 14 * MIN}`, kind: 'wakeup', prompt: '<<autonomous-loop-dynamic>>', detail: 'watching the build', nextAt: T0 + 14 * MIN })
+  const tracked = [plan(), wakeup, plan({ id: 'gone' }), plan({ id: 'fresh', seenAt: at - 500 })]
+  const after = reconcileSchedules(tracked, [
+    { id: 'c1', schedule: '4 * * * *', recurring: true, prompt: 'check the deploy' },
+    { id: 'w7', schedule: '14 10 21 10 *', recurring: false, prompt: '<<autonomous-loop-dynamic>>' },
+    { id: 'c9', schedule: '0 * * * *', recurring: true, prompt: 'hourly report ... [+500 chars]' },
+  ], at)
+  expect(after.map(one => one.id)).toEqual(['c1', 'w7', 'fresh', 'c9'])
+  expect(after[0]?.recurring).toBe(true)
+  // The wakeup keeps its time and words under the job's id.
+  expect(after[1]).toEqual({ ...wakeup, id: 'w7' })
+  expect(after[3]).toEqual({ id: 'c9', kind: 'cron', recurring: true, nextAt: 0, detail: 'hourly report', prompt: 'hourly report', seenAt: at })
+})
+
+test('the schedule rows: one with its time and words, several with the next run', async () => {
+  expect(timeTo(0, T0)).toBe('')
+  expect(timeTo(T0 + 4 * MIN, T0)).toBe('4분 후')
+  expect(timeTo(T0 + 62 * MIN, T0)).toBe('1시간 2분 후')
+  expect(timeTo(T0 + 30_000, T0)).toBe('곧')
+  expect(timeTo(T0 - MIN, T0)).toBe('곧')
+  expect(scheduleRow([plan()], T0)).toEqual({ text: '◷ 4분 후 실행 · check the deploy', tone: 'dim', bold: false })
+  expect(scheduleRow([plan({ nextAt: T0 + 20_000 })], T0)?.text).toBe('◷ 곧 실행 · check the deploy')
+  expect(scheduleRow([plan({ nextAt: 0, recurring: true })], T0)?.text).toBe('◷ 반복 예약 · check the deploy')
+  expect(scheduleRow([plan({ nextAt: 0 })], T0)?.text).toBe('◷ 예약 · check the deploy')
+  expect(scheduleRow([plan(), plan({ id: 'c2', nextAt: T0 + 40_000 }), plan({ id: 'c3', nextAt: 0 })], T0)?.text).toBe('◷ 예약 3개 · 다음은 곧 실행')
+  expect(scheduleRow([plan(), plan({ id: 'c2', nextAt: T0 + 9 * MIN })], T0)?.text).toBe('◷ 예약 2개 · 다음은 4분 후')
+  expect(scheduleRow([plan({ nextAt: 0 }), plan({ id: 'c2', nextAt: 0 })], T0)?.text).toBe('◷ 예약 2개')
+  expect(scheduleRow([], T0)).toBeNull()
+  // Beside a turn at work, schedules join the background row, or stand alone.
+  expect(backgroundNote([task()], [plan()], T0)?.text).toBe('◌ 백그라운드: 명령 1개 · 예약 1개 (4분 후)')
+  expect(backgroundNote([], [plan()], T0)?.text).toBe('◷ 4분 후 실행 · check the deploy')
+})
+
+test('the status rows with schedules: in the dim row while working, a row of their own after', async () => {
+  expect(texts(statusRows({ ...STATUS, now: T0, schedules: [plan()] })))
+    .toEqual(['● 작업 중 · 0초', '생각하거나 답을 쓰는 중…', '◷ 4분 후 실행 · check the deploy'])
+  const ended = { ...WORKING, phase: 'done' as const, durationMs: 42_000, tools: 1 }
+  expect(texts(statusRows({ ...STATUS, isWorking: false, work: ended, now: T0, tasks: [task({ startedAt: T0 - 3 * MIN })], schedules: [plan({ nextAt: T0 + 60 * MIN })] })))
+    .toEqual(['✓ 끝났어요 · 42초 걸림 · 도구 1회 · 다음 지시를 기다려요', '◌ 백그라운드 (3분째): 명령 실행 — Run dev server', '◷ 1시간 0분 후 실행 · check the deploy'])
+  expect(texts(statusRows({ ...STATUS, isWorking: false, work: { ...WORKING, phase: 'idle' }, now: T0, schedules: [plan()] })))
+    .toEqual(['◷ 4분 후 실행 · check the deploy'])
 })
 
 test('a teammate in a pane of its own is not counted as at work', async () => {
@@ -1051,4 +1145,87 @@ test('a helper\'s background command is left to the snapshot, but its TaskStop s
   expect(await shown()).toContain('◌ 백그라운드: 명령 실행 — Run dev server')
   await $.tool.call({ tool: 'TaskStop', task_id: 'b1', agentId: 'agent-1' } as never)
   expect(await shown()).not.toContain('◌ 백그라운드')
+})
+
+const scheduleRecords = (e: { tool: string } & Record<string, unknown>, now: number) =>
+  e.tool === 'CronCreate'
+    ? { id: 'c1', humanSchedule: 'every hour', recurring: e['recurring'] !== false, nextFireAt: now + 4 * MIN }
+    : e.tool === 'CronDelete'
+      ? { id: String(e['id']) }
+      : e.tool === 'ScheduleWakeup'
+        ? e['stop'] === true
+          ? { scheduledFor: 0, clampedDelaySeconds: 0, wasClamped: false, stopped: true, cancelledWakeups: 1 }
+          : { scheduledFor: now + 4 * MIN, clampedDelaySeconds: 240, wasClamped: false }
+        : {}
+
+const bandText = async ($: TestArgs[0], surface: 'terminal' | 'desktop' = 'desktop', isWorking = false) => {
+  const ui = await $.ui.mount({ plugin: 'usage-mods', surface, component: 'AbovePrompt', props: { ...PROPS, isWorking } })
+  const text = await drawnText(ui)
+  await ui.unmount()
+  return text
+}
+
+test('a cron job shows with its next run, beside a turn at work and after it, until it is deleted', async ($, on) => {
+  workWorld(on, { answer: e => scheduleRecords(e, T0) })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'remind me', turnId: 't1' })
+  await $.tool.call({ tool: 'CronCreate', cron: '4 * * * *', prompt: 'check the deploy', recurring: false })
+  expect(await bandText($, 'desktop', true)).toContain('◷ 4분 후 실행 · check the deploy')
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await bandText($, surface)).toContain('◷ 4분 후 실행 · check the deploy')
+  }
+  await $.tool.call({ tool: 'CronDelete', id: 'c1' })
+  expect(await bandText($)).not.toContain('◷')
+})
+
+test('a wakeup shows until its prompt fires, and the loop\'s stop ends wakeups but not a recurring job', async ($, on) => {
+  workWorld(on, { answer: e => scheduleRecords(e, T0) })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: '/loop', turnId: 't1' })
+  await $.tool.call({ tool: 'ScheduleWakeup', delaySeconds: 240, reason: 'watching the build', prompt: '<<autonomous-loop-dynamic>>' })
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(await bandText($)).toContain('◷ 4분 후 실행 · watching the build')
+
+  await $.prompt.submit({ text: '<<autonomous-loop-dynamic>>', origin: { kind: 'scheduled-trigger' }, wait: false })
+  expect(await bandText($)).not.toContain('◷')
+
+  await $.tool.call({ tool: 'CronCreate', cron: '0 * * * *', prompt: 'hourly report' })
+  await $.tool.call({ tool: 'ScheduleWakeup', delaySeconds: 240, reason: 'watching the build', prompt: '<<autonomous-loop-dynamic>>' })
+  expect(await bandText($)).toContain('◷ 예약 2개 · 다음은 4분 후')
+  await $.tool.call({ tool: 'ScheduleWakeup', stop: true })
+  expect(await bandText($)).toContain('◷ 4분 후 실행 · hourly report')
+})
+
+test('a stop\'s snapshot names a wakeup by its job and brings back schedules after a /clear', async ($, on) => {
+  const world = workWorld(on, { answer: e => scheduleRecords(e, T0) })
+  on('session.end', () => ({ sessionId: 's1' }))
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: '/loop', turnId: 't1' })
+  await $.tool.call({ tool: 'ScheduleWakeup', delaySeconds: 240, reason: 'watching the build', prompt: '<<autonomous-loop-dynamic>>' })
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  await world.clock.advance(SNAPSHOT_GRACE_MS)
+  const crons = [{ id: 'w7', schedule: '4 * * * *', recurring: false, prompt: '<<autonomous-loop-dynamic>>' }]
+  await $.classic.Stop({ stop_hook_active: false, session_crons: crons })
+  // Still the wakeup with its time, now under the job's id: a later snapshot keeps it.
+  await world.clock.advance(SNAPSHOT_GRACE_MS)
+  await $.classic.Stop({ stop_hook_active: false, session_crons: crons })
+  expect(await bandText($)).toContain('◷ 4분 후 실행 · watching the build')
+
+  await $.session.end({ reason: 'clear' })
+  expect(await bandText($)).not.toContain('◷')
+  await $.classic.Stop({ stop_hook_active: false, session_crons: [{ id: 'c9', schedule: '0 * * * *', recurring: true, prompt: 'hourly report' }] })
+  expect(await bandText($)).toContain('◷ 반복 예약 · hourly report')
+})
+
+test('the band turns a schedule to 곧 실행 on time, with no minute clock to wait for', async ($, on) => {
+  const world = workWorld(on, { answer: e => scheduleRecords(e, T0) })
+  await $.session.measure(MEASURE)
+  await $.turn.start({ text: 'remind me', turnId: 't1' })
+  await $.tool.call({ tool: 'CronCreate', cron: '4 * * * *', prompt: 'check the deploy', recurring: false })
+  await $.turn.complete({ answer: '', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
+  await world.clock.advance(2_000)
+  expect(await bandText($)).toContain('◷ 4분 후 실행')
+  await world.clock.advance(3 * MIN)
+  expect(await bandText($)).toContain('◷ 곧 실행 · check the deploy')
 })
